@@ -1,0 +1,30 @@
+{
+  "name": "buildflow-plan-to-ifc",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "mkdir -p output && esbuild src/lib/ifc/writeIfc4.test.ts --bundle --platform=node --format=esm --outfile=output/test.mjs --packages=external && node --test output/test.mjs",
+    "sample": "tsx scripts/generate-sample.ts",
+    "export:sample": "mkdir -p output && esbuild scripts/export-sample.ts --bundle --platform=node --format=esm --outfile=output/export.mjs --packages=external && node output/export.mjs"
+  },
+  "dependencies": {
+    "next": "^15.5.2",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "sharp": "^0.34.3",
+    "three": "^0.170.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "@types/three": "^0.170.0",
+    "esbuild": "^0.25.9",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
