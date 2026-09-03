@@ -53,6 +53,43 @@ export function Converter() {
     setPreview(url);
   }
 
+  function debugOpenings(label: string, graph: BuildingGraph | null) {
+    if (!graph) return;
+  
+    const doors = graph.openings.filter((o) => o.type === "door");
+    const windows = graph.openings.filter((o) => o.type === "window");
+  
+    const orphanOpenings = graph.openings.filter(
+      (o) => !graph.walls.some((w) => w.id === o.wallId),
+    );
+  
+    console.group(`[${label}]`);
+  
+    console.log("Walls:", graph.walls.length);
+    console.log("Openings:", graph.openings.length);
+    console.log("Doors:", doors.length);
+    console.log("Windows:", windows.length);
+  
+    console.table(
+      doors.map((d) => ({
+        id: d.id,
+        wallId: d.wallId,
+        offset: d.offset,
+        width: d.width,
+        height: d.height,
+        confidence: d.confidence,
+        hinge: d.hinge,
+        swing: d.swing,
+      })),
+    );
+  
+    if (orphanOpenings.length) {
+      console.warn("ORPHAN OPENINGS:", orphanOpenings);
+    }
+  
+    console.groupEnd();
+  }
+
   function beginNewSource() {
     loadGen.current += 1;
     setSourceKey((k) => k + 1);
@@ -69,16 +106,26 @@ export function Converter() {
 
   const stats = useMemo(() => {
     if (!graph) return null;
+  
     const area = graph.spaces.reduce(
       (s, sp) => s + (sp.area ?? polygonArea(sp.polygon)),
       0,
     );
+  
+    const doors = graph.openings.filter((o) => o.type === "door");
+    const windows = graph.openings.filter((o) => o.type === "window");
+  
+    const orphanOpenings = graph.openings.filter(
+      (o) => !graph.walls.some((w) => w.id === o.wallId),
+    );
+  
     return {
       walls: graph.walls.length,
       openings: graph.openings.length,
-      doors: graph.doors?.length ?? graph.openings.filter((o) => o.type === "door").length,
-      windows: graph.windows?.length ?? graph.openings.filter((o) => o.type === "window").length,
+      doors: doors.length,
+      windows: windows.length,
       spaces: graph.spaces.length,
+      orphanOpenings: orphanOpenings.length,
       area,
     };
   }, [graph]);
@@ -105,7 +152,10 @@ export function Converter() {
       const res = await fetch("/api/sample", { cache: "no-store" });
       const data = await res.json();
       if (gen !== loadGen.current) return;
-      setGraph(enrichGraph(data.graph));
+      const analyzedGraph = enrichGraph(data.graph);
+      debugOpenings("AFTER ANALYZE", analyzedGraph);
+
+      setGraph(analyzedGraph);
       setIfc(data.ifc);
       showPreview(data.png);
       setPhase("solved");
@@ -141,7 +191,10 @@ export function Converter() {
       if (typeof data.png === "string" && data.png.startsWith("data:")) {
         showPreview(data.png);
       }
-      setGraph(enrichGraph(data.graph));
+      const analyzedGraph = enrichGraph(data.graph);
+      debugOpenings("AFTER ANALYZE", analyzedGraph);
+
+      setGraph(analyzedGraph);
       setStoreyHeightM(Number(data.graph?.storeyHeight) > 2.3 ? data.graph.storeyHeight : 3);
       setPhase("confirm");
       setReport(data.report ?? null);

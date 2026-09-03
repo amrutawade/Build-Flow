@@ -207,6 +207,17 @@ function wallFromSpan(src: Wall, horiz: boolean, a: number, b: number): Wall {
   };
 }
 
+function averageThickness(a: Wall, b: Wall): number {
+  const la = wallFrame(a).length;
+  const lb = wallFrame(b).length;
+
+  return (
+    (a.thickness * la + b.thickness * lb) /
+    Math.max(la + lb, 1e-6)
+  );
+}
+
+
 /**
  * Join colinear fragments across door/window gaps so the opening is hosted
  * on one centerline (and visible in 3D), without merging T-junction splits.
@@ -234,16 +245,16 @@ function bridgeColinearOpenings(walls: Wall[]): { walls: Wall[]; openings: Openi
         const external = isExternalWall(wall, box, 0.55);
         const isWindow = width >= 0.9 && external;
         if (!isWindow && (width < 0.55 || width > 1.2)) continue;
-        openings.push({
-          id: `${isWindow ? "WIN" : "D"}-g${n++}`,
-          type: isWindow ? "window" : "door",
-          wallId: wall.id,
-          offset: Math.max(0, offset),
-          width,
-          height: isWindow ? 1.2 : 2.1,
-          sill: isWindow ? 0.9 : 0,
-          confidence: 0.7,
-        });
+        // openings.push({
+        //   id: `${isWindow ? "WIN" : "D"}-g${n++}`,
+        //   type: isWindow ? "window" : "door",
+        //   wallId: wall.id,
+        //   offset: Math.max(0, offset),
+        //   width,
+        //   height: isWindow ? 1.2 : 2.1,
+        //   sill: isWindow ? 0.9 : 0,
+        //   confidence: 0.7,
+        // });
       }
     };
 
@@ -258,18 +269,54 @@ function bridgeColinearOpenings(walls: Wall[]): { walls: Wall[]; openings: Openi
       const windowLike = gap > 1.2 && gap <= 3.8 && external;
       if (gap < -0.04) {
         cur.b = Math.max(cur.b, next.b);
-        if (wallFrame(next.w).length > wallFrame(cur.w).length) cur.w = next.w;
+        const mergedThickness = averageThickness(cur.w, next.w);
+
+        if (wallFrame(next.w).length > wallFrame(cur.w).length) {
+          cur.w = {
+            ...next.w,
+            thickness: mergedThickness,
+          };
+        } else {
+          cur.w = {
+            ...cur.w,
+            thickness: mergedThickness,
+          };
+        }
       } else if (
         gap >= 0.04 &&
         gap < 0.55 &&
         !tAtSpan(walls, horiz, pos, cur.b, next.a)
       ) {
         cur.b = next.b;
-        if (wallFrame(next.w).length > wallFrame(cur.w).length) cur.w = next.w;
+        const mergedThickness = averageThickness(cur.w, next.w);
+
+        if (wallFrame(next.w).length > wallFrame(cur.w).length) {
+          cur.w = {
+            ...next.w,
+            thickness: mergedThickness,
+          };
+        } else {
+          cur.w = {
+            ...cur.w,
+            thickness: mergedThickness,
+          };
+        }
       } else if (doorLike || windowLike) {
         cur.holes.push({ a: cur.b, b: next.a });
         cur.b = next.b;
-        if (wallFrame(next.w).length > wallFrame(cur.w).length) cur.w = next.w;
+        const mergedThickness = averageThickness(cur.w, next.w);
+
+        if (wallFrame(next.w).length > wallFrame(cur.w).length) {
+          cur.w = {
+            ...next.w,
+            thickness: mergedThickness,
+          };
+        } else {
+          cur.w = {
+            ...cur.w,
+            thickness: mergedThickness,
+          };
+        }
       } else {
         flush();
         cur = { w: next.w, a: next.a, b: next.b, holes: [] };
@@ -301,52 +348,172 @@ function tAtSpan(
 }
 
 /** Snap endpoints, close T-junctions, split crossings, rehost openings. */
-export function repairTopology(graph: BuildingGraph): BuildingGraph {
+export function repairTopology(
+  graph: BuildingGraph,
+): BuildingGraph {
   const snap = snapToleranceMeters(graph);
-  const aligned = pinOntoCrossings(
-    extendToJunctions(snapOrthogonal(graph.walls, Math.min(snap, 0.1)), 0.55),
-    Math.max(snap, 0.12),
+
+  // Keep topology repair conservative.
+  // 30-50 mm is the tolerance for actual connectivity.
+  const endpointTol = Math.min(
+    Math.max(snap, 0.03),
+    0.05,
   );
-  const walls: Wall[] = aligned.map((w) => ({ ...w }));
 
-  const split = splitAtCrossings(splitAtJunctions(walls, Math.max(snap, 0.06)));
-  const extended = extendToJunctions(split, 0.55);
-  let joined = extended.filter((w) => dist(w.start, w.end) > 0.05);
-  joined = sealWallNetwork(joined);
-  const bridged = bridgeColinearOpenings(joined);
-  const cleaned = sealWallNetwork(bridged.walls);
-  const fromVision = rehostOpenings(graph.walls, cleaned, graph.openings);
-  const openings = dedupeOpenings(
-    [...fromVision, ...bridged.openings],
+  const junctionTol = Math.min(
+    Math.max(snap, 0.03),
+    0.05,
+  );
+
+  const aligned = pinOntoCrossings(
+    extendToJunctions(
+      snapOrthogonal(
+        graph.walls,
+        endpointTol,
+      ),
+      0.10,
+    ),
+    endpointTol,
+  );
+
+  const walls: Wall[] = aligned.map((w) => ({
+    ...w,
+  }));
+
+  // Split actual intersections/T-junctions.
+  const split = splitAtCrossings(
+    splitAtJunctions(
+      walls,
+      junctionTol,
+    ),
+  );
+
+  // Small controlled extension only.
+  const extended = extendToJunctions(
+    split,
+    0.10,
+  );
+
+  let cleaned = extended.filter(
+    (w) =>
+      dist(w.start, w.end) > 0.05,
+  );
+
+  // Seal only very small topology gaps.
+  cleaned = sealWallNetwork(
     cleaned,
-  ).filter(
-    (opening) => {
-      const host = cleaned.find((w) => w.id === opening.wallId);
-      if (!host) return false;
-      const len = wallFrame(host).length;
-      const maxW = opening.type === "window" ? 3.8 : 1.3;
-      const minW = opening.type === "window" ? 0.35 : 0.5;
-      if (opening.width < minW || opening.width > maxW) return false;
-      return opening.offset + opening.width <= len + 0.12;
-    },
-  ).map((opening) => {
-    const host = cleaned.find((w) => w.id === opening.wallId)!;
-    const len = wallFrame(host).length;
-    const width = Math.min(opening.width, len - 0.05);
-    const offset = Math.max(0, Math.min(opening.offset, Math.max(0, len - width)));
-    const isWindow = opening.type === "window";
-    return {
-      ...opening,
-      offset,
-      width,
-      type: isWindow ? ("window" as const) : ("door" as const),
-      height: isWindow ? opening.height || 1.2 : opening.height || 2.1,
-      sill: isWindow ? opening.sill || 0.9 : 0,
-    };
-  });
+  );
 
-  const padded = padHostsToCorners(cleaned, openings);
-  return { ...graph, walls: padded.walls, openings: padded.openings };
+  /*
+   * IMPORTANT:
+   *
+   * Do NOT call bridgeColinearOpenings().
+   *
+   * A gap does not mean door/window.
+   */
+  const fromVision = rehostOpenings(
+    graph.walls,
+    cleaned,
+    graph.openings,
+  );
+
+  const openings = dedupeOpenings(
+    fromVision,
+    cleaned,
+  )
+    .filter((opening) => {
+      const host = cleaned.find(
+        (w) => w.id === opening.wallId,
+      );
+
+      if (!host) return false;
+
+      const len =
+        wallFrame(host).length;
+
+      const minW =
+        opening.type === "window"
+          ? 0.35
+          : 0.5;
+
+      const maxW =
+        opening.type === "window"
+          ? 3.8
+          : 1.2;
+
+      if (
+        opening.width < minW ||
+        opening.width > maxW
+      ) {
+        return false;
+      }
+
+      return (
+        opening.offset >= -0.03 &&
+        opening.offset +
+          opening.width <=
+          len + 0.03
+      );
+    })
+    .map((opening) => {
+      const host = cleaned.find(
+        (w) => w.id === opening.wallId,
+      )!;
+
+      const len =
+        wallFrame(host).length;
+
+      const width = Math.min(
+        opening.width,
+        len - 0.02,
+      );
+
+      const offset = Math.max(
+        0,
+        Math.min(
+          opening.offset,
+          Math.max(
+            0,
+            len - width,
+          ),
+        ),
+      );
+
+      /*
+       * Preserve the detected type.
+       *
+       * NEVER do:
+       * type: opening.type === "window"
+       *   ? "window"
+       *   : "door"
+       */
+      return {
+        ...opening,
+        offset,
+        width,
+
+        height:
+          opening.type === "window"
+            ? opening.height || 1.2
+            : opening.height || 2.1,
+
+        sill:
+          opening.type === "window"
+            ? opening.sill || 0.9
+            : 0,
+      };
+    });
+
+  const padded = padHostsToCorners(
+    cleaned,
+    openings,
+  );
+
+  return {
+    ...graph,
+    walls: padded.walls,
+    openings: padded.openings,
+  };
 }
 
 function dedupeOpenings(openings: Opening[], walls: Wall[]): Opening[] {

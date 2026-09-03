@@ -28,9 +28,21 @@ export async function graphFromCalibrated(
 ): Promise<BuildingGraph> {
   const origW = cal.width;
   const origH = cal.height;
-  const scale = Math.min(1, WORK_MAX / Math.max(origW, origH));
-  const workW = Math.max(1, Math.round(origW * scale));
-  const workH = Math.max(1, Math.round(origH * scale));
+
+  const scale = Math.min(
+    1,
+    WORK_MAX / Math.max(origW, origH),
+  );
+
+  const workW = Math.max(
+    1,
+    Math.round(origW * scale),
+  );
+
+  const workH = Math.max(
+    1,
+    Math.round(origH * scale),
+  );
 
   const { data, info } = await sharp(cal.png)
     .resize(workW, workH, { fit: "fill" })
@@ -42,37 +54,133 @@ export async function graphFromCalibrated(
   const w = info.width;
   const h = info.height;
   const gray = data;
+
+  // Conversion from working-image pixels back to original pixels.
   const sx = origW / w;
   const sy = origH / h;
 
+  // ------------------------------------------------------------
+  // 1. Detect dark ink
+  // ------------------------------------------------------------
+
   const thresh = darkThreshold(gray);
+
   const candidates = [false, true].map((invert) => {
-    const mask = makeMask(gray, w, h, thresh, invert);
-    dropSmallBlobs(mask, w, h, Math.max(16, Math.round((w * h) / 25000)));
-    return { invert, mask, score: scoreMask(mask, w, h) };
+    const mask = makeMask(
+      gray,
+      w,
+      h,
+      thresh,
+      invert,
+    );
+
+    dropSmallBlobs(
+      mask,
+      w,
+      h,
+      Math.max(
+        16,
+        Math.round((w * h) / 25000),
+      ),
+    );
+
+    return {
+      invert,
+      mask,
+      score: scoreMask(mask, w, h),
+    };
   });
-  candidates.sort((a, b) => b.score - a.score);
+
+  candidates.sort(
+    (a, b) => b.score - a.score,
+  );
+
   const invert = candidates[0].invert;
   const ink = candidates[0].mask;
-  const { wall: wallInk, light: lightInk } = splitInkLayers(gray, ink, invert);
+
+  // ------------------------------------------------------------
+  // 2. Split dark wall ink from lighter door/window symbols
+  // ------------------------------------------------------------
+
+  const {
+    wall: wallInk,
+    light: lightInk,
+  } = splitInkLayers(
+    gray,
+    ink,
+    invert,
+  );
+
+  // ------------------------------------------------------------
+  // 3. Build wall mask
+  // ------------------------------------------------------------
+
   const opened = new Uint8Array(wallInk);
-  openMask(opened, w, h);
+
+  openMask(
+    opened,
+    w,
+    h,
+  );
+
   const lined = keepLinePixels(
     wallInk,
     w,
     h,
-    Math.max(6, Math.round(Math.min(w, h) * 0.008)),
+    Math.max(
+      6,
+      Math.round(
+        Math.min(w, h) * 0.008,
+      ),
+    ),
   );
-  const mask = unionMask(opened, lined);
 
-  const bbox = bounds(mask, w, h);
-  const bboxOrigW = Math.max(1, (bbox.x1 - bbox.x0) * sx);
-  const bboxOrigH = Math.max(1, (bbox.y1 - bbox.y0) * sy);
+  const mask = unionMask(
+    opened,
+    lined,
+  );
+
+  // ------------------------------------------------------------
+  // 4. Calculate drawing bounds and scale
+  // ------------------------------------------------------------
+
+  const bbox = bounds(
+    mask,
+    w,
+    h,
+  );
+
+  const bboxOrigW = Math.max(
+    1,
+    (bbox.x1 - bbox.x0) * sx,
+  );
+
+  const bboxOrigH = Math.max(
+    1,
+    (bbox.y1 - bbox.y0) * sy,
+  );
+
   const metersPerPixel =
-    options.metersPerPixel ?? 12 / Math.max(bboxOrigW, bboxOrigH);
-  const wallHeight = saneStoreyHeight(options.wallHeight ?? options.storeyHeight);
+    options.metersPerPixel ??
+    12 /
+      Math.max(
+        bboxOrigW,
+        bboxOrigH,
+      );
 
-  const toM = (x: number, y: number): Vec2 =>
+  const wallHeight = saneStoreyHeight(
+    options.wallHeight ??
+      options.storeyHeight,
+  );
+
+  // ------------------------------------------------------------
+  // 5. Pixel -> world conversion
+  // ------------------------------------------------------------
+
+  const toM = (
+    x: number,
+    y: number,
+  ): Vec2 =>
     pixelToWorld(
       {
         metersPerPixel,
@@ -84,7 +192,14 @@ export async function graphFromCalibrated(
       y * sy,
     );
 
-  const { walls, openings } = wallsFromMask(
+  // ------------------------------------------------------------
+  // 6. Detect walls and initial openings
+  // ------------------------------------------------------------
+
+  const {
+    walls,
+    openings,
+  } = wallsFromMask(
     mask,
     w,
     h,
@@ -97,11 +212,13 @@ export async function graphFromCalibrated(
   );
 
   const warnings: string[] = [];
+
   if (walls.length < 4) {
     warnings.push(
       "Could not read a clear orthogonal wall grid from this drawing. Use a high-contrast plan with walls as dark lines, not a photo of a faded print.",
     );
   }
+
   if (!options.metersPerPixel) {
     warnings.push(
       "Scale is estimated (longest ink span ≈ 12 m). Confirm with a known wall length before writing IFC.",
@@ -122,15 +239,42 @@ export async function graphFromCalibrated(
     openings,
     spaces: [],
   };
-  graph = repairTopology(graph);
-  const hull = envelopeOf(
-    graph.walls.filter((wall) => wallFrame(wall).length >= 1),
+
+  // ------------------------------------------------------------
+  // 7. Scan openings ALONG THE DETECTED WALLS
+  //
+  // IMPORTANT:
+  // scanOpeningsAlongWalls() expects:
+  //
+  //   wallInk
+  //   lightInk
+  //   working width
+  //   working height
+  //   BuildingGraph
+  //   sx
+  //   sy
+  //
+  // NOT:
+  //
+  //   CalibratedImage
+  //   Wall[]
+  //   ConvertOptions
+  // ------------------------------------------------------------
+
+  const scanned = scanOpeningsAlongWalls(
+    wallInk,
+    lightInk,
+    w,
+    h,
+    graph,
+    sx,
+    sy,
   );
-  graph.walls = graph.walls.map((wall) => ({
-    ...wall,
-    kind: isEnvelopeWall(wall, hull, 0.85) ? "external" : "internal",
-  }));
-  const scanned = scanOpeningsAlongWalls(wallInk, lightInk, w, h, graph, sx, sy);
+
+  // ------------------------------------------------------------
+  // 8. Merge opening candidates
+  // ------------------------------------------------------------
+
   graph.openings = sanitizeOpenings(
     mergeOpenings(
       scanned,
@@ -139,24 +283,111 @@ export async function graphFromCalibrated(
     ),
     graph.walls,
   );
-  graph.openings = annotateDoorSwings(lightInk, w, h, graph, sx, sy);
+
+  // ------------------------------------------------------------
+  // 9. Repair wall topology
+  // ------------------------------------------------------------
+
+  graph = repairTopology(graph);
+
+  // ------------------------------------------------------------
+  // 10. Determine external / internal walls
+  // ------------------------------------------------------------
+
+  const hull = envelopeOf(
+    graph.walls.filter(
+      (wall) =>
+        wallFrame(wall).length >= 1,
+    ),
+  );
+
+  graph.walls = graph.walls.map(
+    (wall) => ({
+      ...wall,
+      kind: isEnvelopeWall(
+        wall,
+        hull,
+        0.85,
+      )
+        ? "external"
+        : "internal",
+    }),
+  );
+
+  // ------------------------------------------------------------
+  // 11. Detect / annotate door swings
+  // ------------------------------------------------------------
+
+  graph.openings = annotateDoorSwings(
+    lightInk,
+    w,
+    h,
+    graph,
+    sx,
+    sy,
+  );
+
+  // ------------------------------------------------------------
+  // 12. Repair opening jambs and wall corners
+  // ------------------------------------------------------------
+
   const padded = padHostsToCorners(
-    joinOpeningJambs(graph.walls, graph.openings),
+    joinOpeningJambs(
+      graph.walls,
+      graph.openings,
+    ),
     graph.openings,
   );
+
   graph.walls = padded.walls;
   graph.openings = padded.openings;
-  const fromWalls = spacesFromWalls(graph.walls);
+
+  // ------------------------------------------------------------
+  // 13. Generate spaces
+  // ------------------------------------------------------------
+
+  const fromWalls = spacesFromWalls(
+    graph.walls,
+  );
+
   graph.spaces =
     fromWalls.length >= 2
       ? fromWalls
-      : roomsByFlood(mask, w, h, origH, sx, sy, metersPerPixel);
-  graph.walls = graph.walls.map((wall) => ({ ...wall, height: wallHeight }));
-  graph.doors = graph.openings.filter((o) => o.type === "door");
-  graph.windows = graph.openings.filter((o) => o.type === "window");
+      : roomsByFlood(
+          mask,
+          w,
+          h,
+          origH,
+          sx,
+          sy,
+          metersPerPixel,
+        );
+
+  // ------------------------------------------------------------
+  // 14. Final wall/opening properties
+  // ------------------------------------------------------------
+
+  graph.walls = graph.walls.map(
+    (wall) => ({
+      ...wall,
+      height: wallHeight,
+    }),
+  );
+
+  graph.doors =
+    graph.openings.filter(
+      (opening) =>
+        opening.type === "door",
+    );
+
+  graph.windows =
+    graph.openings.filter(
+      (opening) =>
+        opening.type === "window",
+    );
+
   return graph;
 }
-
 type Frag = {
   horiz: boolean;
   pos: number;
@@ -165,6 +396,95 @@ type Frag = {
   thickness: number;
   score: number;
 };
+
+
+function estimateLocalWallThickness(
+  mask: Uint8Array,
+  w: number,
+  h: number,
+  peak: Peak,
+  horiz: boolean,
+  a: number,
+  b: number,
+  sx: number,
+  sy: number,
+  metersPerPixel: number,
+): number {
+  const samples: number[] = [];
+
+  const start = Math.ceil(a);
+  const end = Math.floor(b);
+
+  // Sample multiple points along the wall.
+  const step = Math.max(8, Math.round((end - start) / 12));
+
+  for (let along = start; along <= end; along += step) {
+    let lo = peak.pos;
+    let hi = peak.pos;
+
+    if (horiz) {
+      // Horizontal wall -> thickness measured along Y.
+      while (
+        lo > 0 &&
+        mask[Math.round(lo - 1) * w + Math.round(along)]
+      ) {
+        lo--;
+      }
+
+      while (
+        hi < h - 1 &&
+        mask[Math.round(hi + 1) * w + Math.round(along)]
+      ) {
+        hi++;
+      }
+
+      const pixelThickness = hi - lo + 1;
+      samples.push(pixelThickness * sy * metersPerPixel);
+    } else {
+      // Vertical wall -> thickness measured along X.
+      while (
+        lo > 0 &&
+        mask[Math.round(along) * w + Math.round(lo - 1)]
+      ) {
+        lo--;
+      }
+
+      while (
+        hi < w - 1 &&
+        mask[Math.round(along) * w + Math.round(hi + 1)]
+      ) {
+        hi++;
+      }
+
+      const pixelThickness = hi - lo + 1;
+      samples.push(pixelThickness * sx * metersPerPixel);
+    }
+  }
+
+  if (samples.length === 0) {
+    return 0.15;
+  }
+
+  samples.sort((a, b) => a - b);
+
+  // Remove extreme values.
+  const filtered = samples.filter(
+    (v) => v >= 0.07 && v <= 0.40,
+  );
+
+  if (filtered.length === 0) {
+    return 0.15;
+  }
+
+  const mid = Math.floor(filtered.length / 2);
+
+  const median =
+    filtered.length % 2 === 0
+      ? (filtered[mid - 1] + filtered[mid]) / 2
+      : filtered[mid];
+
+  return clamp(median, 0.09, 0.35);
+}
 
 function wallsFromMask(
   mask: Uint8Array,
@@ -186,11 +506,29 @@ function wallsFromMask(
     alongScale: number,
     thickScale: number,
   ) => {
-    const thickness = clamp(peak.thick * thickScale * metersPerPixel, 0.1, 0.23);
     for (const run of runs) {
       if (run.kind !== "wall") continue;
-      const len = (run.b - run.a) * alongScale * metersPerPixel;
+  
+      const thickness = estimateLocalWallThickness(
+        mask,
+        w,
+        h,
+        peak,
+        horiz,
+        run.a,
+        run.b,
+        sx,
+        sy,
+        metersPerPixel,
+      );
+  
+      const len =
+        (run.b - run.a) *
+        alongScale *
+        metersPerPixel;
+  
       if (len < 0.35) continue;
+  
       frags.push({
         horiz,
         pos: peak.pos,
@@ -201,7 +539,6 @@ function wallsFromMask(
       });
     }
   };
-
   for (const band of projectionBands(bbox, "h")) {
     for (const peak of densityPeaks(mask, w, h, "h", band)) {
       const runs = stripRuns(
@@ -366,7 +703,26 @@ function stitchFrags(
     const pos = Math.round(
       group.reduce((s, f) => s + f.pos, 0) / group.length,
     );
-    const thickness = group.reduce((s, f) => s + f.thickness, 0) / group.length;
+    const thicknessWeight = group.reduce(
+      (sum, f) =>
+        sum +
+        f.thickness *
+          ((f.b - f.a) * alongScale * metersPerPixel),
+      0,
+    );
+    
+    const lengthWeight = group.reduce(
+      (sum, f) =>
+        sum +
+        (f.b - f.a) * alongScale * metersPerPixel,
+      0,
+    );
+    
+    const thickness =
+      lengthWeight > 0
+        ? thicknessWeight / lengthWeight
+        : 0.15;
+        
     const score = Math.max(...group.map((f) => f.score));
     const spans = group
       .map((f) => ({ a: f.a, b: f.b }))
@@ -868,31 +1224,111 @@ function mergeOpenings(
   }
   return kept;
 }
-
-function sanitizeOpenings(openings: Opening[], walls: Wall[]): Opening[] {
+function sanitizeOpenings(
+  openings: Opening[],
+  walls: Wall[],
+): Opening[] {
   return openings
-    .map((opening) => {
+    .map((opening): Opening | null => {
       const host = walls.find((w) => w.id === opening.wallId);
+
       if (!host) return null;
+
       const len = wallFrame(host).length;
+
+      if (!Number.isFinite(len) || len <= 0) {
+        return null;
+      }
+
+      // Keep the detected type. Do NOT convert non-window openings to doors.
       const isWindow = opening.type === "window";
-      const width = isWindow
-        ? clamp(opening.width, 0.4, Math.min(3.8, Math.max(0.5, len - 0.12)))
-        : clamp(opening.width, 0.7, Math.min(1.1, Math.max(0.7, len - 0.15)));
-      if (width > len - 0.12) return null;
-      const offset = Math.max(
-        0.04,
-        Math.min(opening.offset, len - width - 0.04),
+      const isDoor = opening.type === "door";
+
+      // Ignore unsupported/unknown opening types instead of guessing.
+      if (!isWindow && !isDoor) {
+        return null;
+      }
+
+      // Minimum clearance from both wall ends.
+      const endClearance = isWindow ? 0.05 : 0.04;
+
+      const maxWidth = Math.max(
+        0,
+        len - endClearance * 2,
       );
+
+      if (maxWidth <= 0) {
+        return null;
+      }
+
+      // Use different limits for doors and windows,
+      // but never use width to determine the opening type.
+      const minWidth = isWindow ? 0.4 : 0.7;
+      const preferredMaxWidth = isWindow ? 3.8 : 1.1;
+
+      const allowedMaxWidth = Math.min(
+        preferredMaxWidth,
+        maxWidth,
+      );
+
+      if (allowedMaxWidth < minWidth) {
+        return null;
+      }
+
+      const width = clamp(
+        Number.isFinite(opening.width)
+          ? opening.width
+          : minWidth,
+        minWidth,
+        allowedMaxWidth,
+      );
+
+      if (!Number.isFinite(width) || width <= 0) {
+        return null;
+      }
+
+      // Keep the opening completely inside the host wall.
+      const maxOffset = len - width - endClearance;
+
+      if (maxOffset < endClearance) {
+        return null;
+      }
+
+      const offset = clamp(
+        Number.isFinite(opening.offset)
+          ? opening.offset
+          : endClearance,
+        endClearance,
+        maxOffset,
+      );
+
       return {
         ...opening,
+
+        // IMPORTANT:
+        // Preserve the detected type.
+        type: opening.type,
+
         width,
         offset,
-        height: isWindow ? 1.2 : 2.1,
-        sill: isWindow ? 0.9 : 0,
+
+        // Only provide defaults when needed.
+        height:
+          Number.isFinite(opening.height) && opening.height > 0
+            ? opening.height
+            : isWindow
+              ? 1.2
+              : 2.1,
+
+        sill:
+          isWindow
+            ? Number.isFinite(opening.sill) && opening.sill >= 0
+              ? opening.sill
+              : 0.9
+            : 0,
       };
     })
-    .filter((o): o is Opening => o !== null);
+    .filter((opening): opening is Opening => opening !== null);
 }
 
 function annotateDoorSwings(
