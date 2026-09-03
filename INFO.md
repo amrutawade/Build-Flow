@@ -1,5 +1,49 @@
 2D Floor Plan —> 3D Model The current app is a classical orthogonal-plan reader, not a learned detector. It follows the same 01–10 story as the reference pipeline, with two hard limits: axis-aligned walls only, and no LLM for coordinates.
 
+***
+                    FLOOR PLAN
+                        │
+                        ▼
+                 calibrateImage()
+                        │
+                        ▼
+                  wall detection
+                        │
+                        ▼
+                wall candidates
+                        │
+              ┌─────────┴─────────┐
+              ▼                   ▼
+       opening candidates    room/space candidates
+              │
+       ┌──────┴──────┐
+       ▼             ▼
+  door detection   window detection
+       │             │
+       └──────┬──────┘
+              ▼
+        merge openings
+              │
+              ▼
+        sanitize openings
+              │
+              ▼
+        repair topology
+              │
+              ▼
+       rehost openings
+              │
+              ▼
+         enrich graph
+              │
+              ▼
+       validate graph
+              │
+              ▼
+          IFC4 export
+
+          ***
+
 How this maps to the reference pipeline
 Ref	What the code does	Where
 01 Input	PNG/JPEG only. PDF/DXF are rejected.	analyze/route.ts
@@ -92,4 +136,5 @@ pixels → deskew/threshold → H/V density ridges → centerline fragments
 
 So T-junction failure is usually not “3D extrusion is wrong”. It is 2D: the stem is missing, too short, or the through-wall was broken at the junction before topology could snap and split.
 If you want this fixed in code, switch to Agent mode; the highest-leverage changes are: keep short interior stems, extend T-tips to the nearest orthogonal segment (not only if that segment already covers the tip), and do not classify a collinear gap as an opening when a perpendicular wall already points at that gap (tAtSpan exists but only for small gaps < 0.55 m).
+
 
