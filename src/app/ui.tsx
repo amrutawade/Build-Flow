@@ -27,6 +27,7 @@ export function Converter() {
   const [storeyHeight, setStoreyHeightM] = useState(3);
   const [metersPerPixel, setMetersPerPixel] = useState("");
   const [knownLength, setKnownLength] = useState("");
+  const [allPages, setAllPages] = useState(true);
   const [view, setView] = useState<"3d" | "2d">("3d");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("empty");
@@ -180,6 +181,7 @@ export function Converter() {
       form.set("file", file);
       form.set("storeyHeight", String(storeyHeight >= 2.4 ? storeyHeight : 3));
       if (metersPerPixel) form.set("metersPerPixel", metersPerPixel);
+      if (file.name.toLowerCase().endsWith(".pdf")) form.set("allPages", String(allPages));
       const res = await fetch("/api/analyze", {
         method: "POST",
         body: form,
@@ -329,7 +331,11 @@ export function Converter() {
 
       <div className="row">
         <aside className="panel">
-          <label htmlFor="height">Storey height (m)</label>
+                      <label className="field-row" style={{ marginTop: 8 }}>
+              <input type="checkbox" checked={allPages} onChange={e => setAllPages(e.target.checked)} />
+              <span>PDF: process all pages as storeys</span>
+            </label>
+<label htmlFor="height">Storey height (m)</label>
           <input
             id="height"
             type="number"

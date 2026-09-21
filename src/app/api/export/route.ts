@@ -33,6 +33,7 @@ const GraphSchema = z.object({
   windows: z.array(z.any()).optional(),
   openings: z.array(z.any()),
   spaces: z.array(z.any()),
+  storeys: z.array(z.any()).optional(),
 });
 
 export async function POST(req: Request) {

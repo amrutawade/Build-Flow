@@ -1,4 +1,4 @@
-import type { BuildingGraph, Opening, Vec2, Wall } from "../models";
+import type { BuildingGraph, Opening, Vec2, Wall, StoreyGraph } from "../models";
 import { polygonArea } from "../geometry/area";
 import { wallFrame } from "../geometry/frame";
 import { fmt, ifcGuidFromKey } from "./guid";
@@ -99,103 +99,88 @@ class Writer {
   }
 
   writeModel(graph: BuildingGraph): void {
-    const appOrg = this.emit(
-      `IFCORGANIZATION($,${this.str("BuildFlow")},${this.str("plan2ifc")},$,$)`,
-    );
-    const app = this.emit(
-      `IFCAPPLICATION(#${appOrg},${this.str("0.1.0")},${this.str("plan2ifc")},${this.str("plan2ifc")})`,
-    );
+    const appOrg = this.emit(`IFCORGANIZATION($,${this.str("BuildFlow")},${this.str("plan2ifc")},$,$)`);
+    const app = this.emit(`IFCAPPLICATION(#${appOrg},${this.str("0.1.0")},${this.str("plan2ifc")},${this.str("plan2ifc")})`);
     const person = this.emit(`IFCPERSON($,${this.str("Owner")},$,$,$,$,$,$)`);
     const org = this.emit(`IFCORGANIZATION($,${this.str("Owner")},$,$,$)`);
     const pao = this.emit(`IFCPERSONANDORGANIZATION(#${person},#${org},$)`);
-    const oh = this.emit(
-      `IFCOWNERHISTORY(#${pao},#${app},$,.ADDED.,$,$,$,${this.now})`,
-    );
+    const oh = this.emit(`IFCOWNERHISTORY(#${pao},#${app},$,.ADDED.,$,$,$,${this.now})`);
 
     const origin = this.pt3(0, 0, 0);
     const zDir = this.dir(0, 0, 1);
     const xDir = this.dir(1, 0, 0);
     const world = this.axis3(origin, zDir, xDir);
-    const worldCtx = this.emit(
-      `IFCGEOMETRICREPRESENTATIONCONTEXT($,${this.str("Model")},3,1.0E-5,#${world},$)`,
-    );
-    const bodyCtx = this.emit(
-      `IFCGEOMETRICREPRESENTATIONSUBCONTEXT(${this.str("Body")},${this.str("Model")},*,*,*,*,#${worldCtx},$,.MODEL_VIEW.,$)`,
-    );
+    const worldCtx = this.emit(`IFCGEOMETRICREPRESENTATIONCONTEXT($,${this.str("Model")},3,1.0E-5,#${world},$)`);
+    const bodyCtx = this.emit(`IFCGEOMETRICREPRESENTATIONSUBCONTEXT(${this.str("Body")},${this.str("Model")},*,*,*,*,#${worldCtx},$,.MODEL_VIEW.,$)`);
     const metre = this.emit(`IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.)`);
     const sqm = this.emit(`IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.)`);
     const units = this.emit(`IFCUNITASSIGNMENT((#${metre},#${sqm}))`);
 
-    const project = this.emit(
-      `IFCPROJECT(${this.guid()},#${oh},${this.str(graph.name)},${this.str("Generated from 2D floor plan")},$,$,$,(#${worldCtx}),#${units})`,
-    );
+    const project = this.emit(`IFCPROJECT(${this.guid()},#${oh},${this.str(graph.name)},${this.str("Generated from 2D floor plan")},$,$,$,(#${worldCtx}),#${units})`);
     const sitePlace = this.localPlacement();
-    const site = this.emit(
-      `IFCSITE(${this.guid()},#${oh},${this.str("Site")},$,$,#${sitePlace},$,$,.ELEMENT.,$,$,$,$,$)`,
-    );
+    const site = this.emit(`IFCSITE(${this.guid()},#${oh},${this.str("Site")},$,$,#${sitePlace},$,$,.ELEMENT.,$,$,$,$,$)`);
     const buildingPlace = this.localPlacement(sitePlace);
-    const building = this.emit(
-      `IFCBUILDING(${this.guid()},#${oh},${this.str("Building")},$,$,#${buildingPlace},$,$,.ELEMENT.,$,$,$)`,
-    );
-    const storeyPlacement = this.localPlacement(buildingPlace);
-    const storey = this.emit(
-      `IFCBUILDINGSTOREY(${this.guid()},#${oh},${this.str(graph.storeyName)},$,$,#${storeyPlacement},$,$,.ELEMENT.,${fmt(0)})`,
-    );
+    const building = this.emit(`IFCBUILDING(${this.guid()},#${oh},${this.str("Building")},$,$,#${buildingPlace},$,$,.ELEMENT.,$,$,$)`);
 
-    this.emit(
-      `IFCRELAGGREGATES(${this.guid()},#${oh},$,$,#${project},(#${site}))`,
-    );
-    this.emit(
-      `IFCRELAGGREGATES(${this.guid()},#${oh},$,$,#${site},(#${building}))`,
-    );
-    this.emit(
-      `IFCRELAGGREGATES(${this.guid()},#${oh},$,$,#${building},(#${storey}))`,
-    );
+    const storeys: StoreyGraph[] = graph.storeys?.length
+      ? graph.storeys
+      : [{
+          storeyName: graph.storeyName,
+          elevation: 0,
+          storeyHeight: graph.storeyHeight,
+          metersPerPixel: graph.metersPerPixel,
+          metersPerPdfUnit: graph.metersPerPdfUnit,
+          imageWidth: graph.imageWidth,
+          imageHeight: graph.imageHeight,
+          imageOffsetX: graph.imageOffsetX,
+          imageOffsetY: graph.imageOffsetY,
+          warnings: graph.warnings,
+          walls: graph.walls,
+          openings: graph.openings,
+          doors: graph.doors,
+          windows: graph.windows,
+          spaces: graph.spaces,
+        }];
 
-    const productIds: Ref[] = [];
-    const wallByKey = new Map<string, Ref>();
+    this.emit(`IFCRELAGGREGATES(${this.guid()},#${oh},$,$,#${project},(#${site}))`);
+    this.emit(`IFCRELAGGREGATES(${this.guid()},#${oh},$,$,#${site},(#${building}))`);
 
-    for (const wall of graph.walls) {
-      const wallRef = this.writeWall(wall, oh, storeyPlacement, bodyCtx);
-      productIds.push(wallRef);
-      wallByKey.set(wall.id, wallRef);
+    const storeyRefs: Ref[] = [];
+    for (const storeyGraph of storeys) {
+      const storeyPlace3 = this.axis3(this.pt3(0, 0, storeyGraph.elevation), zDir, xDir);
+      const storeyPlacement = this.emit(`IFCLOCALPLACEMENT(#${buildingPlace},#${storeyPlace3})`);
+      const storey = this.emit(`IFCBUILDINGSTOREY(${this.guid(storeyGraph.storeyName)},#${oh},${this.str(storeyGraph.storeyName)},$,$,#${storeyPlacement},$,$,.ELEMENT.,$)`);
+      storeyRefs.push(storey);
+
+      const productIds: Ref[] = [];
+      const wallByKey = new Map<string, Ref>();
+      for (const wall of storeyGraph.walls) {
+        const wallRef = this.writeWall(wall, oh, storeyPlacement, bodyCtx);
+        productIds.push(wallRef);
+        wallByKey.set(wall.id, wallRef);
+      }
+      for (const opening of collectOpenings(storeyGraph)) {
+        const hostWall = storeyGraph.walls.find(x => x.id === opening.wallId);
+        const host = hostWall ? wallByKey.get(hostWall.id) : undefined;
+        if (!host || !hostWall) continue;
+        const { fillerRef } = this.writeOpening(opening, hostWall, host, oh, storeyPlacement, bodyCtx);
+        productIds.push(fillerRef);
+      }
+      for (const space of storeyGraph.spaces) {
+        productIds.push(this.writeSpace(space, storeyGraph.storeyHeight, oh, storeyPlacement, bodyCtx));
+      }
+      const slab = this.writeSlab(storeyGraph as BuildingGraph, oh, storeyPlacement, bodyCtx);
+      if (slab) productIds.push(slab);
+      if (productIds.length) {
+        this.emit(`IFCRELCONTAINEDINSPATIALSTRUCTURE(${this.guid(storeyGraph.storeyName)},#${oh},$,$,(${productIds.map(n => `#${n}`).join(",")}),#${storey})`);
+      }
     }
 
-    for (const opening of collectOpenings(graph)) {
-      const hostWall = graph.walls.find((x) => x.id === opening.wallId);
-      const host = hostWall ? wallByKey.get(hostWall.id) : undefined;
-      if (!host || !hostWall) continue;
-      const { fillerRef } = this.writeOpening(
-        opening,
-        hostWall,
-        host,
-        oh,
-        storeyPlacement,
-        bodyCtx,
-      );
-      productIds.push(fillerRef);
-    }
-
-    for (const space of graph.spaces) {
-      productIds.push(
-        this.writeSpace(space, graph.storeyHeight, oh, storeyPlacement, bodyCtx),
-      );
-    }
-
-    const slab = this.writeSlab(graph, oh, storeyPlacement, bodyCtx);
-    if (slab) productIds.push(slab);
-
-    if (productIds.length > 0) {
-      this.emit(
-        `IFCRELCONTAINEDINSPATIALSTRUCTURE(${this.guid()},#${oh},$,$,(${productIds.map((n) => `#${n}`).join(",")}),#${storey})`,
-      );
-    }
+    this.emit(`IFCRELAGGREGATES(${this.guid()},#${oh},$,$,#${building},(${storeyRefs.map(n => `#${n}`).join(",")}))`);
 
     for (const [material, products] of this.byMaterial) {
-      if (products.length === 0) continue;
-      this.emit(
-        `IFCRELASSOCIATESMATERIAL(${this.guid()},#${oh},$,$,(${products.map((n) => `#${n}`).join(",")}),#${material})`,
-      );
+      if (!products.length) continue;
+      this.emit(`IFCRELASSOCIATESMATERIAL(${this.guid()},#${oh},$,$,(${products.map(n => `#${n}`).join(",")}),#${material})`);
     }
   }
 

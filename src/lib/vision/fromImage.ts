@@ -26,14 +26,18 @@ export async function graphFromCalibrated(
   cal: CalibratedImage,
   options: ConvertOptions,
 ): Promise<BuildingGraph> {
+  const workMax =
+  options.rasterWorkMax ??
+  1600;
+
   const origW = cal.width;
   const origH = cal.height;
 
   const scale = Math.min(
     1,
-    WORK_MAX / Math.max(origW, origH),
+    workMax / Math.max(origW, origH),
   );
-
+  
   const workW = Math.max(
     1,
     Math.round(origW * scale),
@@ -44,16 +48,57 @@ export async function graphFromCalibrated(
     Math.round(origH * scale),
   );
 
-  const { data, info } = await sharp(cal.png)
+  // Keep RGB as well as grayscale. Some architectural PDFs (for example
+  // Hard.pdf) use red/pink walls instead of black walls. Converting to
+  // grayscale and then clamping the threshold to 100 loses those walls.
+  const { data: rgb, info } = await sharp(cal.png)
     .resize(workW, workH, { fit: "fill" })
-    .grayscale()
-    .median(3)
+    .removeAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
 
   const w = info.width;
   const h = info.height;
-  const gray = data;
+  const channels = info.channels;
+  const gray = new Uint8Array(w * h);
+  const colorWallInk = new Uint8Array(w * h);
+  const colorSymbolInk = new Uint8Array(w * h);
+
+  for (let i = 0, p = 0; i < gray.length; i++, p += channels) {
+    const r = rgb[p] ?? 255;
+    const g = channels > 1 ? rgb[p + 1] : r;
+    const b = channels > 2 ? rgb[p + 2] : r;
+
+    gray[i] = Math.round(
+      0.299 * r +
+      0.587 * g +
+      0.114 * b,
+    );
+
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const sat = max - min;
+
+    // Red/pink architectural wall strokes.
+    const redWall =
+      sat >= 18 &&
+      r >= 145 &&
+      r > g + 15 &&
+      r > b + 15 &&
+      Math.abs(g - b) <= 60;
+
+    // Cyan/blue/red colored CAD symbols. These are useful for
+    // window/door evidence but should not become wall geometry.
+    const coloredSymbol =
+      sat >= 18 &&
+      max < 252 &&
+      (redWall ||
+        (g > r + 18 && b > r + 18) ||
+        (b > r + 18 && b > g + 5));
+
+    if (redWall) colorWallInk[i] = 1;
+    if (coloredSymbol) colorSymbolInk[i] = 1;
+  }
 
   // Conversion from working-image pixels back to original pixels.
   const sx = origW / w;
@@ -65,6 +110,9 @@ export async function graphFromCalibrated(
 
   const thresh = darkThreshold(gray);
 
+  // Combine grayscale ink with colored wall strokes. We still keep the
+  // inverted candidate for old black/white scans, but colored PDF walls
+  // are explicitly protected from thresholding.
   const candidates = [false, true].map((invert) => {
     const mask = makeMask(
       gray,
@@ -73,6 +121,12 @@ export async function graphFromCalibrated(
       thresh,
       invert,
     );
+
+    if (!invert) {
+      for (let i = 0; i < mask.length; i++) {
+        if (colorWallInk[i]) mask[i] = 1;
+      }
+    }
 
     dropSmallBlobs(
       mask,
@@ -102,26 +156,57 @@ export async function graphFromCalibrated(
   // 2. Split dark wall ink from lighter door/window symbols
   // ------------------------------------------------------------
 
-  const {
-    wall: wallInk,
-    light: lightInk,
-  } = splitInkLayers(
+  const split = splitInkLayers(
     gray,
     ink,
     invert,
+    colorWallInk,
+  );
+
+  // Never let colored architectural wall strokes get classified as
+  // lightweight symbols. This is the critical fix for Hard.pdf.
+  // Keep a second, slightly more permissive grayscale wall layer. This is
+  // important for medium.pdf where anti-aliased black walls are not always
+  // in the darkest Otsu bucket. Long-line filtering below removes most text
+  // and dimension noise.
+  const wallGray = makeMask(
+    gray,
+    w,
+    h,
+    Math.max(thresh, Math.min(180, thresh + 25)),
+    false,
+  );
+
+  const wallInk = unionMask(
+    unionMask(split.wall, colorWallInk),
+    wallGray,
+  );
+
+  // Keep lighter grayscale strokes and colored CAD symbols available to the
+  // door/window classifier. Do not add a broad grayscale mask here because
+  // hollowRectWindows() intentionally uses wall/symbol ink to find cavities.
+  const lightInk = unionMask(
+    split.light,
+    colorSymbolInk,
   );
 
   // ------------------------------------------------------------
   // 3. Build wall mask
   // ------------------------------------------------------------
 
+  // Do not run an erosion-first opening operation on the complete wall
+  // image. PDF rasterization often produces 1–3 px wall strokes and the
+  // erosion can delete them. Keep the original wall ink and only use the
+  // opening operation as an additional mask.
   const opened = new Uint8Array(wallInk);
 
-  openMask(
-    opened,
-    w,
-    h,
-  );
+  if (Math.min(w, h) >= 700) {
+    openMask(
+      opened,
+      w,
+      h,
+    );
+  }
 
   const lined = keepLinePixels(
     wallInk,
@@ -163,14 +248,14 @@ export async function graphFromCalibrated(
   const metersPerPixel =
     options.metersPerPixel ??
     12 /
-      Math.max(
-        bboxOrigW,
-        bboxOrigH,
-      );
+    Math.max(
+      bboxOrigW,
+      bboxOrigH,
+    );
 
   const wallHeight = saneStoreyHeight(
     options.wallHeight ??
-      options.storeyHeight,
+    options.storeyHeight,
   );
 
   // ------------------------------------------------------------
@@ -196,11 +281,11 @@ export async function graphFromCalibrated(
   // 6. Detect walls and initial openings
   // ------------------------------------------------------------
 
-  const {
-    walls,
-    openings,
-  } = wallsFromMask(
+  const detected = wallsFromMask(
     mask,
+    wallInk,
+    lightInk,
+    gray,
     w,
     h,
     bbox,
@@ -210,6 +295,9 @@ export async function graphFromCalibrated(
     sx,
     sy,
   );
+
+  const walls = detected.walls;
+  const openings = detected.openings;
 
   const warnings: string[] = [];
 
@@ -262,6 +350,7 @@ export async function graphFromCalibrated(
   // ------------------------------------------------------------
 
   const scanned = scanOpeningsAlongWalls(
+    gray,
     wallInk,
     lightInk,
     w,
@@ -275,10 +364,28 @@ export async function graphFromCalibrated(
   // 8. Merge opening candidates
   // ------------------------------------------------------------
 
+  const hollowWindows = hollowRectWindows(
+    unionMask(wallInk, lightInk),
+    w,
+    h,
+    graph,
+    sx,
+    sy,
+  );
+
   graph.openings = sanitizeOpenings(
-    mergeOpenings(
-      scanned,
-      graph.openings,
+    dedupeOpeningCandidates(
+      mergeOpenings(
+        mergeWindowPanes(
+          scanned,
+          graph.walls,
+        ),
+        mergeWindowPanes(
+          hollowWindows,
+          graph.walls,
+        ),
+        graph.walls,
+      ),
       graph.walls,
     ),
     graph.walls,
@@ -288,7 +395,23 @@ export async function graphFromCalibrated(
   // 9. Repair wall topology
   // ------------------------------------------------------------
 
+  // Keep a safe pre-repair copy. The topology repairer is intentionally
+  // conservative and older plans can occasionally cause it to reject every
+  // wall. Never turn a valid detection into an empty model.
+  const preRepairWalls = graph.walls.map((wall) => ({ ...wall }));
+  const preRepairOpenings = graph.openings.map((opening) => ({ ...opening }));
+
   graph = repairTopology(graph);
+
+  if (graph.walls.length < 4 && preRepairWalls.length >= 4) {
+    graph.walls = preRepairWalls;
+    graph.openings = preRepairOpenings.filter((opening) =>
+      preRepairWalls.some((wall) => wall.id === opening.wallId),
+    );
+    graph.warnings.push(
+      "Topology repair was skipped because it removed most detected walls; original detected wall geometry was retained.",
+    );
+  }
 
   // ------------------------------------------------------------
   // 10. Determine external / internal walls
@@ -354,14 +477,14 @@ export async function graphFromCalibrated(
     fromWalls.length >= 2
       ? fromWalls
       : roomsByFlood(
-          mask,
-          w,
-          h,
-          origH,
-          sx,
-          sy,
-          metersPerPixel,
-        );
+        mask,
+        w,
+        h,
+        origH,
+        sx,
+        sy,
+        metersPerPixel,
+      );
 
   // ------------------------------------------------------------
   // 14. Final wall/opening properties
@@ -485,9 +608,227 @@ function estimateLocalWallThickness(
 
   return clamp(median, 0.09, 0.35);
 }
+type OpeningClassification = {
+  type: "door" | "window";
+  confidence: number;
+};
+
+type OpeningEvidence = {
+  doorArc: number;
+  doorLeaf: number;
+  doorJamb: number;
+  windowLines: number;
+  windowJamb: number;
+  gap: number;
+};
+
+function classifyOpening(
+  gray: Uint8Array,
+  lightInk: Uint8Array,
+  imageW: number,
+  imageH: number,
+  g: {
+    horiz: boolean;
+    pos: number;
+    a: number;
+    b: number;
+  },
+  hole: {
+    a: number;
+    b: number;
+  },
+  alongScale: number,
+  metersPerPixel: number,
+): OpeningClassification | null {
+  const widthPx = Math.max(1, hole.b - hole.a);
+  const cx = (hole.a + hole.b) * 0.5;
+
+  const centerX = g.horiz ? cx : g.pos;
+  const centerY = g.horiz ? g.pos : cx;
+
+  const dirX = g.horiz ? 1 : 0;
+  const dirY = g.horiz ? 0 : 1;
+
+  // Both normal directions are tested by the symbol detectors.
+  const normalX = g.horiz ? 0 : 1;
+  const normalY = g.horiz ? 1 : 0;
+
+  const widthM = widthPx * alongScale * metersPerPixel;
+
+  const doorArc = detectDoorSwingArc(
+    gray,
+    lightInk,
+    imageW,
+    imageH,
+    centerX,
+    centerY,
+    widthPx * 0.5,
+    dirX,
+    dirY,
+    normalX,
+    normalY,
+  );
+
+  const doorLeaf = detectDoorLeaf(
+    gray,
+    lightInk,
+    imageW,
+    imageH,
+    centerX,
+    centerY,
+    widthPx * 0.5,
+    dirX,
+    dirY,
+    normalX,
+    normalY,
+  );
+
+  const doorJamb = detectOpeningJambs(
+    gray,
+    lightInk,
+    imageW,
+    imageH,
+    centerX,
+    centerY,
+    widthPx,
+    dirX,
+    dirY,
+    normalX,
+    normalY,
+  );
+
+  const windowLines = detectWindowLines(
+    gray,
+    imageW,
+    imageH,
+    centerX,
+    centerY,
+    widthPx * 0.5,
+    dirX,
+    dirY,
+    normalX,
+    normalY,
+  );
+
+  const windowJamb = detectWindowJambPattern(
+    gray,
+    lightInk,
+    imageW,
+    imageH,
+    centerX,
+    centerY,
+    widthPx,
+    dirX,
+    dirY,
+    normalX,
+    normalY,
+  );
+
+  // Width is a weak prior only. It must never decide the type by itself.
+  const doorWidthPrior =
+    widthM >= 0.55 && widthM <= 1.45
+      ? 1
+      : widthM >= 0.45 && widthM <= 1.7
+        ? 0.45
+        : 0;
+
+  const windowWidthPrior =
+    widthM >= 0.5 && widthM <= 3.8
+      ? 1
+      : widthM >= 0.35 && widthM <= 4.2
+        ? 0.4
+        : 0;
+
+  const evidence: OpeningEvidence = {
+    doorArc,
+    doorLeaf,
+    doorJamb,
+    windowLines,
+    windowJamb,
+    gap: 1,
+  };
+
+  const doorScore =
+    evidence.doorArc * 0.42 +
+    evidence.doorLeaf * 0.23 +
+    evidence.doorJamb * 0.17 +
+    doorWidthPrior * 0.08 +
+    (1 - evidence.windowLines) * 0.10;
+
+  const windowScore =
+    evidence.windowLines * 0.42 +
+    evidence.windowJamb * 0.23 +
+    evidence.doorJamb * 0.12 +
+    windowWidthPrior * 0.13 +
+    (1 - evidence.doorArc) * 0.10;
+
+  const best = Math.max(doorScore, windowScore);
+  const separation = Math.abs(doorScore - windowScore);
+
+  // Strong symbol evidence can rescue unusual widths.
+  const strongDoor =
+    doorArc >= 0.42 ||
+    (doorLeaf >= 0.52 && doorJamb >= 0.35);
+
+  const strongWindow =
+    windowLines >= 0.48 ||
+    (windowJamb >= 0.55 && windowLines >= 0.28);
+
+  // PDF rasterization weakens thin door arcs/leaves. Keep a low-confidence
+  // candidate when there is meaningful jamb/leaf evidence instead of
+  // discarding the opening entirely.
+  const weakDoor =
+    doorJamb >= 0.14 ||
+    doorLeaf >= 0.16 ||
+    doorArc >= 0.12;
+
+  const weakWindow =
+    windowLines >= 0.12 ||
+    windowJamb >= 0.16;
+
+  if (best < 0.18 && !strongDoor && !strongWindow && !weakDoor && !weakWindow) {
+    return null;
+  }
+
+  if (doorScore >= windowScore) {
+    if (!strongDoor && !weakDoor && separation < 0.04 && doorScore < 0.34) {
+      return null;
+    }
+    return {
+      type: "door",
+      confidence: clamp(
+        Math.max(
+          doorScore,
+          strongDoor ? 0.46 : weakDoor ? 0.30 : 0,
+        ),
+        0,
+        0.98,
+      ),
+    };
+  }
+
+  if (!strongWindow && !weakWindow && separation < 0.04 && windowScore < 0.34) {
+    return null;
+  }
+
+  return {
+    type: "window",
+    confidence: clamp(
+      Math.max(
+        windowScore,
+        strongWindow ? 0.46 : weakWindow ? 0.30 : 0,
+      ),
+      0,
+      0.98,
+    ),
+  };
+}
 
 function wallsFromMask(
   mask: Uint8Array,
+  wallInk: Uint8Array,
+  lightInk: Uint8Array,
+  gray: Uint8Array,
   w: number,
   h: number,
   bbox: { x0: number; y0: number; x1: number; y1: number },
@@ -504,11 +845,10 @@ function wallsFromMask(
     runs: { kind: "wall" | "gap"; a: number; b: number }[],
     horiz: boolean,
     alongScale: number,
-    thickScale: number,
   ) => {
     for (const run of runs) {
       if (run.kind !== "wall") continue;
-  
+
       const thickness = estimateLocalWallThickness(
         mask,
         w,
@@ -521,14 +861,14 @@ function wallsFromMask(
         sy,
         metersPerPixel,
       );
-  
+
       const len =
         (run.b - run.a) *
         alongScale *
         metersPerPixel;
-  
+
       if (len < 0.35) continue;
-  
+
       frags.push({
         horiz,
         pos: peak.pos,
@@ -539,46 +879,74 @@ function wallsFromMask(
       });
     }
   };
+
   for (const band of projectionBands(bbox, "h")) {
     for (const peak of densityPeaks(mask, w, h, "h", band)) {
-      const runs = stripRuns(
-        mask,
-        w,
-        h,
-        peak.pos,
-        Math.min(8, Math.max(2, peak.half)),
-        "h",
-        band,
+      ingest(
+        peak,
+        stripRuns(
+          mask,
+          w,
+          h,
+          peak.pos,
+          Math.min(8, Math.max(2, peak.half)),
+          "h",
+          band,
+        ),
+        true,
+        sx,
       );
-      ingest(peak, runs, true, sx, sy);
     }
   }
+
   for (const band of projectionBands(bbox, "v")) {
     for (const peak of densityPeaks(mask, w, h, "v", band)) {
-      const runs = stripRuns(
-        mask,
-        w,
-        h,
-        peak.pos,
-        Math.min(8, Math.max(2, peak.half)),
-        "v",
-        band,
+      ingest(
+        peak,
+        stripRuns(
+          mask,
+          w,
+          h,
+          peak.pos,
+          Math.min(8, Math.max(2, peak.half)),
+          "v",
+          band,
+        ),
+        false,
+        sy,
       );
-      ingest(peak, runs, false, sy, sx);
     }
   }
 
   const stitched = stitchFrags(frags, sx, sy, metersPerPixel);
   const walls: Wall[] = [];
   const openings: Opening[] = [];
+
   let wi = 0;
   let oi = 0;
+
   for (const g of stitched) {
     const alongScale = g.horiz ? sx : sy;
-    const start = g.horiz ? toM(g.a, g.pos) : toM(g.pos, g.a);
-    const end = g.horiz ? toM(g.b, g.pos) : toM(g.pos, g.b);
-    if (Math.hypot(end[0] - start[0], end[1] - start[1]) < 0.4) continue;
+
+    const start = g.horiz
+      ? toM(g.a, g.pos)
+      : toM(g.pos, g.a);
+
+    const end = g.horiz
+      ? toM(g.b, g.pos)
+      : toM(g.pos, g.b);
+
+    if (
+      Math.hypot(
+        end[0] - start[0],
+        end[1] - start[1],
+      ) < 0.4
+    ) {
+      continue;
+    }
+
     const id = `W-${wi++}`;
+
     walls.push({
       id,
       start,
@@ -588,71 +956,594 @@ function wallsFromMask(
       kind: g.thickness >= 0.18 ? "external" : "internal",
       confidence: g.score,
     });
+
     for (const hole of g.holes) {
-      const width = (hole.b - hole.a) * alongScale * metersPerPixel;
-      const offset = (hole.a - g.a) * alongScale * metersPerPixel;
+      const width =
+        (hole.b - hole.a) *
+        alongScale *
+        metersPerPixel;
+
+      const offset =
+        (hole.a - g.a) *
+        alongScale *
+        metersPerPixel;
+
+      const opening = classifyOpening(
+        // These are the current working-image coordinates.
+        // gray/lightInk are captured by the caller's closure in the
+        // previous implementation, so this function now receives them
+        // through the detector wrapper below.
+        gray,
+        lightInk,
+        w,
+        h,
+        g,
+        hole,
+        alongScale,
+        metersPerPixel,
+      );
+
+      if (!opening) continue;
+
+      const radius = Math.max(
+        8,
+        Math.round(
+          width /
+            (metersPerPixel * ((sx + sy) * 0.5)),
+        ),
+      );
+
+      const vote = doorSwingVote(
+        lightInk,
+        w,
+        h,
+        g.horiz ? hole.a : g.pos,
+        g.horiz ? g.pos : hole.a,
+        g.horiz ? hole.b : g.pos,
+        g.horiz ? g.pos : hole.b,
+        g.horiz ? 0 : 1,
+        g.horiz ? 1 : 0,
+        radius,
+      );
+
       openings.push({
         id: `O-${oi++}`,
-        type: width >= 1.05 ? "window" : "door",
+        type: opening.type,
         wallId: id,
         offset: Math.max(0, offset),
         width,
-        height: width >= 1.05 ? 1.2 : 2.1,
-        sill: width >= 1.05 ? 0.9 : 0,
-        confidence: 0.7,
+        height: opening.type === "window" ? 1.2 : 2.1,
+        sill: opening.type === "window" ? 0.9 : 0,
+        confidence: opening.confidence,
+        ...(opening.type === "door"
+          ? {
+              hinge: vote.hinge,
+              swing: vote.swing,
+            }
+          : {}),
       });
     }
   }
 
-  const kept = pruneSketchNoise(nmsParallelWalls(dedupeWalls(walls)));
+  const kept = pruneSketchNoise(
+    nmsParallelWalls(
+      dedupeWalls(walls),
+    ),
+  );
+
   const remapped = openings
     .map((opening) => {
-      if (kept.some((wall) => wall.id === opening.wallId)) return opening;
-      const orig = walls.find((wall) => wall.id === opening.wallId);
+      if (kept.some((wall) => wall.id === opening.wallId)) {
+        return opening;
+      }
+
+      const orig = walls.find(
+        (wall) => wall.id === opening.wallId,
+      );
+
       if (!orig) return null;
+
       const origH =
         Math.abs(orig.end[0] - orig.start[0]) >=
         Math.abs(orig.end[1] - orig.start[1]);
+
       let best: Wall | null = null;
-      let bestD = 0.45;
+      let bestScore = -Infinity;
+
       for (const wall of kept) {
         const horiz =
           Math.abs(wall.end[0] - wall.start[0]) >=
           Math.abs(wall.end[1] - wall.start[1]);
+
         if (horiz !== origH) continue;
+
         const d = origH
           ? Math.abs(
-              (wall.start[1] + wall.end[1]) / 2 - (orig.start[1] + orig.end[1]) / 2,
+              (wall.start[1] + wall.end[1]) * 0.5 -
+                (orig.start[1] + orig.end[1]) * 0.5,
             )
           : Math.abs(
-              (wall.start[0] + wall.end[0]) / 2 - (orig.start[0] + orig.end[0]) / 2,
+              (wall.start[0] + wall.end[0]) * 0.5 -
+                (orig.start[0] + orig.end[0]) * 0.5,
             );
-        if (d < bestD) {
-          bestD = d;
+
+        const overlap = segmentOverlap(
+          orig.start,
+          orig.end,
+          wall.start,
+          wall.end,
+        );
+
+        const score =
+          overlap * 2 -
+          d * 4;
+
+        if (d < 0.5 && score > bestScore) {
+          bestScore = score;
           best = wall;
         }
       }
-      return best ? { ...opening, wallId: best.id } : null;
+
+      return best
+        ? {
+            ...opening,
+            wallId: best.id,
+          }
+        : null;
     })
-    .filter((o): o is Opening => o !== null);
-  const box = envelopeOf(kept);
-  const hosted = remapped.map((o) => {
-      const host = kept.find((wall) => wall.id === o.wallId)!;
-      const ext = isEnvelopeWall(host, box);
-      const isWindow = ext && o.width >= 0.9;
-      const isDoor = !isWindow && o.width >= 0.55 && o.width <= 1.2;
-      if (!isWindow && !isDoor) return null;
+    .filter(
+      (o): o is Opening => o !== null,
+    );
+
+  // IMPORTANT:
+  // Do not reclassify here using "external + width".
+  // The symbol classifier already decided door/window.
+  const sanitized = remapped
+    .map((o) => {
+      const host = kept.find(
+        (wall) => wall.id === o.wallId,
+      );
+      if (!host) return null;
+
+      const len = wallFrame(host).length;
+      if (len <= 0) return null;
+
+      const minWidth =
+        o.type === "window" ? 0.35 : 0.45;
+
+      const maxWidth =
+        o.type === "window"
+          ? Math.min(4.2, len - 0.08)
+          : Math.min(1.7, len - 0.08);
+
+      if (maxWidth < minWidth) return null;
+
+      const width = clamp(
+        o.width,
+        minWidth,
+        maxWidth,
+      );
+
+      const offset = clamp(
+        o.offset,
+        0.04,
+        Math.max(
+          0.04,
+          len - width - 0.04,
+        ),
+      );
+
       return {
         ...o,
-        id: `${isWindow ? "WIN" : "D"}-${o.id}`,
-        type: (isWindow ? "window" : "door") as Opening["type"],
-        height: isWindow ? 1.2 : 2.1,
-        sill: isWindow ? 0.9 : 0,
+        id:
+          o.type === "window"
+            ? `WIN-${o.id}`
+            : `D-${o.id}`,
+        offset,
+        width,
+        height:
+          o.type === "window" ? 1.2 : 2.1,
+        sill:
+          o.type === "window" ? 0.9 : 0,
       };
     })
-    .filter((o): o is Opening => o !== null);
+    .filter(
+      (o): o is Opening => o !== null,
+    );
 
-  return { walls: kept, openings: hosted };
+  return {
+    walls: kept,
+    openings: dedupeOpeningCandidates(
+      sanitized,
+      kept,
+    ),
+  };
+}
+
+function segmentOverlap(
+  a0: Vec2,
+  a1: Vec2,
+  b0: Vec2,
+  b1: Vec2,
+): number {
+  const horizontal =
+    Math.abs(a1[0] - a0[0]) >=
+    Math.abs(a1[1] - a0[1]);
+
+  const aa0 = horizontal
+    ? Math.min(a0[0], a1[0])
+    : Math.min(a0[1], a1[1]);
+
+  const aa1 = horizontal
+    ? Math.max(a0[0], a1[0])
+    : Math.max(a0[1], a1[1]);
+
+  const bb0 = horizontal
+    ? Math.min(b0[0], b1[0])
+    : Math.min(b0[1], b1[1]);
+
+  const bb1 = horizontal
+    ? Math.max(b0[0], b1[0])
+    : Math.max(b0[1], b1[1]);
+
+  const overlap = Math.max(
+    0,
+    Math.min(aa1, bb1) -
+      Math.max(aa0, bb0),
+  );
+
+  const denom = Math.max(
+    0.001,
+    Math.min(aa1 - aa0, bb1 - bb0),
+  );
+
+  return clamp(overlap / denom, 0, 1);
+}
+
+function dedupeOpeningCandidates(
+  openings: Opening[],
+  walls: Wall[],
+): Opening[] {
+  const result: Opening[] = [];
+
+  for (const opening of [...openings].sort(
+    (a, b) => b.confidence - a.confidence,
+  )) {
+    const wall = walls.find(
+      (w) => w.id === opening.wallId,
+    );
+    if (!wall) continue;
+
+    const { ux, uy } = wallFrame(wall);
+    const mid: Vec2 = [
+      wall.start[0] +
+        ux *
+          (opening.offset +
+            opening.width * 0.5),
+      wall.start[1] +
+        uy *
+          (opening.offset +
+            opening.width * 0.5),
+    ];
+
+    const duplicate = result.some((other) => {
+      if (other.wallId !== opening.wallId) {
+        const ow = walls.find(
+          (w) => w.id === other.wallId,
+        );
+        if (!ow) return false;
+        if (
+          Math.abs(
+            wall.start[0] -
+              ow.start[0],
+          ) > 0.25 &&
+          Math.abs(
+            wall.start[1] -
+              ow.start[1],
+          ) > 0.25
+        ) {
+          return false;
+        }
+      }
+
+      const { ux: oux, uy: ouy } =
+        wallFrame(wall);
+      const omid: Vec2 = [
+        wall.start[0] +
+          oux *
+            (other.offset +
+              other.width * 0.5),
+        wall.start[1] +
+          ouy *
+            (other.offset +
+              other.width * 0.5),
+      ];
+
+      return (
+        Math.hypot(
+          mid[0] - omid[0],
+          mid[1] - omid[1],
+        ) < 0.32
+      );
+    });
+
+    if (!duplicate) {
+      result.push(opening);
+    }
+  }
+
+  return result.sort(
+    (a, b) =>
+      a.wallId.localeCompare(b.wallId) ||
+      a.offset - b.offset,
+  );
+}
+
+function detectOpeningJambs(
+  gray: Uint8Array,
+  lightInk: Uint8Array,
+  w: number,
+  h: number,
+  cx: number,
+  cy: number,
+  widthPx: number,
+  dirX: number,
+  dirY: number,
+  normalX: number,
+  normalY: number,
+): number {
+  const half = Math.max(
+    3,
+    widthPx * 0.5,
+  );
+
+  const sampleEndpoint = (
+    side: -1 | 1,
+  ) => {
+    const ex =
+      cx + dirX * half * side;
+    const ey =
+      cy + dirY * half * side;
+
+    let hits = 0;
+    let samples = 0;
+
+    for (
+      let r = -12;
+      r <= 12;
+      r += 2
+    ) {
+      for (const n of [-1, 1]) {
+        const x =
+          ex +
+          normalX *
+            n *
+            r;
+
+        const y =
+          ey +
+          normalY *
+            n *
+            r;
+
+        samples++;
+
+        if (
+          darkAt(
+            gray,
+            lightInk,
+            w,
+            h,
+            x,
+            y,
+          )
+        ) {
+          hits++;
+        }
+      }
+    }
+
+    return hits /
+      Math.max(1, samples);
+  };
+
+  return clamp(
+    (sampleEndpoint(-1) +
+      sampleEndpoint(1)) *
+      1.15,
+    0,
+    1,
+  );
+}
+
+function detectWindowJambPattern(
+  gray: Uint8Array,
+  lightInk: Uint8Array,
+  w: number,
+  h: number,
+  cx: number,
+  cy: number,
+  widthPx: number,
+  dirX: number,
+  dirY: number,
+  normalX: number,
+  normalY: number,
+): number {
+  const half =
+    Math.max(
+      3,
+      widthPx * 0.5,
+    );
+
+  const offsets = [
+    -half,
+    -half * 0.65,
+    half * 0.65,
+    half,
+  ];
+
+  let endpointScore = 0;
+
+  for (const t of offsets) {
+    let hits = 0;
+    let samples = 0;
+
+    for (
+      let r = -18;
+      r <= 18;
+      r += 2
+    ) {
+      const x =
+        cx +
+        dirX * t +
+        normalX * r;
+
+      const y =
+        cy +
+        dirY * t +
+        normalY * r;
+
+      samples++;
+
+      if (
+        darkAt(
+          gray,
+          lightInk,
+          w,
+          h,
+          x,
+          y,
+        )
+      ) {
+        hits++;
+      }
+    }
+
+    endpointScore +=
+      hits /
+      Math.max(1, samples);
+  }
+
+  return clamp(
+    endpointScore /
+      offsets.length *
+      1.5,
+    0,
+    1,
+  );
+}
+
+function isDark(
+  gray: Uint8Array,
+  w: number,
+  h: number,
+  x: number,
+  y: number,
+): boolean {
+  const ix = Math.round(x);
+  const iy = Math.round(y);
+  if (
+    ix < 0 ||
+    iy < 0 ||
+    ix >= w ||
+    iy >= h
+  ) {
+    return false;
+  }
+  return gray[iy * w + ix] < 180;
+}
+
+function detectWindowLines(
+  gray: Uint8Array,
+  w: number,
+  h: number,
+  cx: number,
+  cy: number,
+  halfWidth: number,
+  dirX: number,
+  dirY: number,
+  normalX: number,
+  normalY: number,
+): number {
+
+  const offsets = [
+    -10,
+    -7,
+    -5,
+    5,
+    7,
+    10,
+  ];
+
+  let best = 0;
+
+  for (const offset of offsets) {
+
+    let hits = 0;
+    let samples = 0;
+
+    /*
+     * Follow the wall direction.
+     */
+    for (
+      let t = -0.8;
+      t <= 0.8;
+      t += 0.05
+    ) {
+
+      const x =
+        cx +
+        dirX *
+        halfWidth *
+        t +
+        normalX *
+        offset;
+
+      const y =
+        cy +
+        dirY *
+        halfWidth *
+        t +
+        normalY *
+        offset;
+
+      samples++;
+
+      if (
+        isDark(
+          gray,
+          w,
+          h,
+          x,
+          y,
+        )
+      ) {
+        hits++;
+      }
+    }
+
+    const score =
+      hits /
+      Math.max(
+        1,
+        samples,
+      );
+
+    best =
+      Math.max(
+        best,
+        score,
+      );
+  }
+
+  /*
+   * Require a reasonably continuous line.
+   */
+  return clamp(
+    best * 1.8,
+    0,
+    1,
+  );
 }
 
 function projectionBands(
@@ -707,22 +1598,22 @@ function stitchFrags(
       (sum, f) =>
         sum +
         f.thickness *
-          ((f.b - f.a) * alongScale * metersPerPixel),
+        ((f.b - f.a) * alongScale * metersPerPixel),
       0,
     );
-    
+
     const lengthWeight = group.reduce(
       (sum, f) =>
         sum +
         (f.b - f.a) * alongScale * metersPerPixel,
       0,
     );
-    
+
     const thickness =
       lengthWeight > 0
         ? thicknessWeight / lengthWeight
         : 0.15;
-        
+
     const score = Math.max(...group.map((f) => f.score));
     const spans = group
       .map((f) => ({ a: f.a, b: f.b }))
@@ -751,8 +1642,9 @@ function stitchFrags(
       const gap = (next.a - prev.b) * alongScale * metersPerPixel;
       const leftLen = (prev.b - prev.a) * alongScale * metersPerPixel;
       const rightLen = (next.b - next.a) * alongScale * metersPerPixel;
-      const doorLike = gap >= 0.55 && gap <= 1.2;
-      const windowLike = gap > 1.2 && gap <= 2.4;
+      const symbolGap = gap >= 0.35 && gap <= 4.2;
+      const doorLike = symbolGap;
+      const windowLike = symbolGap;
       if ((doorLike || windowLike) && leftLen >= 0.35 && rightLen >= 0.35) {
         cur.holes.push({ a: prev.b, b: next.a });
         cur.b = next.b;
@@ -839,6 +1731,7 @@ function isEnvelopeWall(
  * - lighter stroke joined to an arc in a wall cut → door
  */
 function scanOpeningsAlongWalls(
+  gray: Uint8Array,
   wallInk: Uint8Array,
   lightInk: Uint8Array,
   w: number,
@@ -851,179 +1744,421 @@ function scanOpeningsAlongWalls(
   const openings: Opening[] = [];
   let n = 0;
 
-  const hit = (src: Uint8Array, x: number, y: number) => {
+  const hit = (
+    src: Uint8Array,
+    x: number,
+    y: number,
+  ) => {
     const ix = Math.round(x);
     const iy = Math.round(y);
-    if (ix < 0 || iy < 0 || ix >= w || iy >= h) return 0;
+    if (
+      ix < 0 ||
+      iy < 0 ||
+      ix >= w ||
+      iy >= h
+    ) {
+      return 0;
+    }
     return src[iy * w + ix];
   };
 
-  type Col = "solid" | "cavity" | "mullion" | "empty";
+  type Col =
+    | "solid"
+    | "cavity"
+    | "mullion"
+    | "empty";
 
   for (const wall of graph.walls) {
     const { length } = wallFrame(wall);
-    if (length < 0.7) continue;
-    const [p0x, p0y] = worldToPixel(graph, wall.start[0], wall.start[1]);
-    const [p1x, p1y] = worldToPixel(graph, wall.end[0], wall.end[1]);
+    if (length < 0.55) continue;
+
+    const [p0x, p0y] =
+      worldToPixel(
+        graph,
+        wall.start[0],
+        wall.start[1],
+      );
+
+    const [p1x, p1y] =
+      worldToPixel(
+        graph,
+        wall.end[0],
+        wall.end[1],
+      );
+
     const x0 = p0x / sx;
     const y0 = p0y / sy;
     const x1 = p1x / sx;
     const y1 = p1y / sy;
+
     const dx = x1 - x0;
     const dy = y1 - y0;
-    const pixLen = Math.hypot(dx, dy) || 1;
+    const pixLen =
+      Math.hypot(dx, dy) || 1;
+
     const nx = -dy / pixLen;
     const ny = dx / pixLen;
-    const maxR = Math.max(
-      8,
-      Math.round((Math.max(wall.thickness, 0.12) * 2.4) / (mpp * ((sx + sy) / 2))),
-    );
-    const steps = Math.max(24, Math.round(pixLen));
-    const faceBand = Math.max(2, Math.round(maxR * 0.32));
-    const coreBand = Math.max(1, Math.round(maxR * 0.28));
-    const cols: Col[] = new Array(steps + 1);
 
-    const profile = (src: Uint8Array, cx: number, cy: number) => {
+    const maxR = clamp(
+      Math.round(
+        (Math.max(wall.thickness, 0.10) *
+          2.8) /
+          (mpp * ((sx + sy) * 0.5)),
+      ),
+      6,
+      70,
+    );
+
+    const steps = Math.max(
+      32,
+      Math.round(pixLen),
+    );
+
+    const faceBand = Math.max(
+      2,
+      Math.round(maxR * 0.34),
+    );
+
+    const coreBand = Math.max(
+      1,
+      Math.round(maxR * 0.25),
+    );
+
+    const profile = (
+      src: Uint8Array,
+      cx: number,
+      cy: number,
+    ) => {
       let dark = 0;
       let facePos = 0;
       let faceNeg = 0;
       let core = 0;
-      for (let r = -maxR; r <= maxR; r++) {
-        if (!hit(src, cx + nx * r, cy + ny * r)) continue;
+
+      for (
+        let r = -maxR;
+        r <= maxR;
+        r++
+      ) {
+        if (
+          !hit(
+            src,
+            cx + nx * r,
+            cy + ny * r,
+          )
+        ) {
+          continue;
+        }
+
         dark++;
-        if (r >= maxR - faceBand) facePos++;
-        else if (r <= -maxR + faceBand) faceNeg++;
-        else if (Math.abs(r) <= coreBand) core++;
+
+        if (
+          r >=
+          maxR - faceBand
+        ) {
+          facePos++;
+        } else if (
+          r <=
+          -maxR + faceBand
+        ) {
+          faceNeg++;
+        } else if (
+          Math.abs(r) <=
+          coreBand
+        ) {
+          core++;
+        }
       }
-      return { dark, facePos, faceNeg, core };
+
+      return {
+        dark,
+        facePos,
+        faceNeg,
+        core,
+      };
     };
 
-    for (let i = 0; i <= steps; i++) {
+    const cols: Col[] =
+      new Array(steps + 1);
+
+    for (
+      let i = 0;
+      i <= steps;
+      i++
+    ) {
       const t = i / steps;
       const cx = x0 + dx * t;
       const cy = y0 + dy * t;
-      const p = profile(wallInk, cx, cy);
-      if (p.dark <= 1) cols[i] = "empty";
-      else if (p.facePos >= 1 && p.faceNeg >= 1 && p.core <= 1) cols[i] = "cavity";
-      else if (p.facePos >= 1 && p.faceNeg >= 1 && p.core >= 2 && p.dark < maxR * 0.9)
+
+      const p = profile(
+        wallInk,
+        cx,
+        cy,
+      );
+
+      if (p.dark <= 1) {
+        cols[i] = "empty";
+      } else if (
+        p.facePos >= 1 &&
+        p.faceNeg >= 1 &&
+        p.core <= 1
+      ) {
+        cols[i] = "cavity";
+      } else if (
+        p.facePos >= 1 &&
+        p.faceNeg >= 1 &&
+        p.core >= 2 &&
+        p.dark < maxR * 0.95
+      ) {
         cols[i] = "mullion";
-      else cols[i] = "solid";
+      } else {
+        cols[i] = "solid";
+      }
     }
 
-    const cavityFrac = cols.filter((c) => c === "cavity").length / cols.length;
-    const doubleLineWall = cavityFrac > 0.55;
+    // Remove tiny classification flicker.
+    for (let i = 1; i < cols.length - 1; i++) {
+      if (
+        cols[i - 1] ===
+          cols[i + 1] &&
+        cols[i] !== cols[i - 1]
+      ) {
+        cols[i] = cols[i - 1];
+      }
+    }
 
-    const runs: { kind: Col; a: number; b: number }[] = [];
+    const runs: {
+      kind: Col;
+      a: number;
+      b: number;
+    }[] = [];
+
     let i = 0;
     while (i <= steps) {
       const kind = cols[i];
       const a = i;
-      while (i <= steps && cols[i] === kind) i++;
-      runs.push({ kind, a, b: i - 1 });
+
+      while (
+        i <= steps &&
+        cols[i] === kind
+      ) {
+        i++;
+      }
+
+      const b = i - 1;
+
+      if (b - a >= 2) {
+        runs.push({
+          kind,
+          a,
+          b,
+        });
+      }
     }
 
     const emit = (
       type: "window" | "door",
       a: number,
       b: number,
+      confidence: number,
       extra: Partial<Opening> = {},
     ) => {
-      const offset = (a / steps) * length;
-      const width = ((b - a) / steps) * length;
-      if (offset < 0.03 || offset + width > length - 0.03) {
-        if (type === "door") return;
-        if (width > length * 0.85) return;
+      const offset =
+        (a / steps) * length;
+
+      const width =
+        ((b - a) / steps) *
+        length;
+
+      if (
+        width < 0.30 ||
+        width > Math.min(4.2, length - 0.06)
+      ) {
+        return;
       }
-      if (type === "window" && (width < 0.35 || width > 3.8)) return;
-      if (type === "door" && (width < 0.5 || width > 1.3)) return;
+
+      const clampedOffset =
+        clamp(
+          offset,
+          0.04,
+          Math.max(
+            0.04,
+            length -
+              width -
+              0.04,
+          ),
+        );
+
       openings.push({
-        id: `${type === "window" ? "WIN" : "D"}-s${n++}`,
+        id: `${type === "window" ? "WIN" : "D"}-scan-${n++}`,
         type,
         wallId: wall.id,
-        offset: Math.max(0, offset),
+        offset: clampedOffset,
         width,
-        height: type === "window" ? 1.2 : 2.1,
-        sill: type === "window" ? 0.9 : 0,
-        confidence: type === "window" ? 0.83 : 0.72,
+        height:
+          type === "window"
+            ? 1.2
+            : 2.1,
+        sill:
+          type === "window"
+            ? 0.9
+            : 0,
+        confidence: clamp(
+          confidence,
+          0.25,
+          0.98,
+        ),
         ...extra,
       });
     };
 
-    for (let r = 0; r < runs.length; r++) {
+    for (
+      let r = 0;
+      r < runs.length;
+      r++
+    ) {
       const run = runs[r];
-      const width = ((run.b - run.a) / steps) * length;
-      if (run.kind === "empty") {
-        const radius = Math.max(8, Math.round(width / (mpp * ((sx + sy) / 2))));
-        const vote = doorSwingVote(
+
+      // A door leaf can cross the wall sampling strip and turn the gap into
+      // a short "mullion" run. Treat that as a candidate too; the symbol
+      // classifier below decides door vs window.
+      if (
+        run.kind !== "empty" &&
+        run.kind !== "cavity" &&
+        run.kind !== "mullion"
+      ) {
+        continue;
+      }
+
+      const widthPx =
+        run.b - run.a;
+
+      const widthM =
+        (widthPx / steps) *
+        length;
+
+      if (
+        widthM < 0.30 ||
+        widthM > 4.2
+      ) {
+        continue;
+      }
+
+      const hole = {
+        a:
+          x0 +
+          (dx * run.a) /
+            steps,
+        b:
+          x0 +
+          (dx * run.b) /
+            steps,
+      };
+
+      const g = {
+        horiz:
+          Math.abs(dx) >=
+          Math.abs(dy),
+        pos:
+          Math.abs(dx) >=
+          Math.abs(dy)
+            ? y0
+            : x0,
+        a:
+          Math.abs(dx) >=
+          Math.abs(dy)
+            ? x0
+            : y0,
+        b:
+          Math.abs(dx) >=
+          Math.abs(dy)
+            ? x1
+            : y1,
+      };
+
+      const holeAlong = {
+        a: Math.min(
+          Math.abs(dx) >= Math.abs(dy)
+            ? x0 + (dx * run.a) / steps
+            : y0 + (dy * run.a) / steps,
+          Math.abs(dx) >= Math.abs(dy)
+            ? x0 + (dx * run.b) / steps
+            : y0 + (dy * run.b) / steps,
+        ),
+        b: Math.max(
+          Math.abs(dx) >= Math.abs(dy)
+            ? x0 + (dx * run.a) / steps
+            : y0 + (dy * run.a) / steps,
+          Math.abs(dx) >= Math.abs(dy)
+            ? x0 + (dx * run.b) / steps
+            : y0 + (dy * run.b) / steps,
+        ),
+      };
+
+      const classified =
+        classifyOpening(
+          gray,
           lightInk,
           w,
           h,
-          x0 + (dx * run.a) / steps,
-          y0 + (dy * run.a) / steps,
-          x0 + (dx * run.b) / steps,
-          y0 + (dy * run.b) / steps,
-          dy / pixLen,
-          -dx / pixLen,
-          radius,
+          g,
+          holeAlong,
+          Math.abs(dx) >= Math.abs(dy)
+            ? sx
+            : sy,
+          mpp,
         );
-        let boxVotes = 0;
-        for (let k = run.a; k <= run.b; k++) {
-          const t = k / steps;
-          const p = profile(lightInk, x0 + dx * t, y0 + dy * t);
-          if (p.facePos >= 1 && p.faceNeg >= 1 && p.core <= 1) boxVotes++;
-        }
-        const hollowBox = boxVotes >= Math.max(3, (run.b - run.a + 1) * 0.28);
-        if (hollowBox) emit("window", run.a, run.b);
-        else if (vote.score >= 0.05) {
-          emit("door", run.a, run.b, {
-            hinge: vote.hinge,
-            swing: vote.swing,
-            confidence: Math.min(0.94, 0.62 + vote.score),
-          });
-        }
-        continue;
-      }
-      if (run.kind !== "cavity") continue;
-      if (doubleLineWall && width > 3.8) continue;
-      const thinMullion = (run: { kind: Col; a: number; b: number } | undefined) =>
-        run?.kind === "mullion" && ((run.b - run.a) / steps) * length < 0.28;
-      let last = r;
-      let panes = 1;
-      while (
-        panes < 3 &&
-        thinMullion(runs[last + 1]) &&
-        runs[last + 2]?.kind === "cavity"
-      ) {
-        const paneW = ((runs[last + 2].b - runs[last + 2].a) / steps) * length;
-        if (paneW < 0.22 || paneW > 1.9) break;
-        last += 2;
-        panes++;
-      }
-      if (panes >= 2) {
-        const pairW = ((runs[last].b - run.a) / steps) * length;
-        if (pairW >= 0.5 && pairW <= 3.8) {
-          emit("window", run.a, runs[last].b);
-          r = last;
-          continue;
-        }
-      }
-      const prev = runs[r - 1];
-      const next = runs[r + 1];
-      const boxed =
-        (prev?.kind === "solid" || prev?.kind === "mullion") &&
-        (next?.kind === "solid" || next?.kind === "mullion");
-      if (boxed || (!doubleLineWall && width <= 2.4)) {
-        emit("window", run.a, run.b);
+
+      if (classified) {
+        const vote =
+          classified.type ===
+          "door"
+            ? doorSwingVote(
+                lightInk,
+                w,
+                h,
+                x0 +
+                  (dx * run.a) /
+                    steps,
+                y0 +
+                  (dy * run.a) /
+                    steps,
+                x0 +
+                  (dx * run.b) /
+                    steps,
+                y0 +
+                  (dy * run.b) /
+                    steps,
+                dy / pixLen,
+                -dx / pixLen,
+                Math.max(
+                  8,
+                  Math.round(
+                    widthPx,
+                  ),
+                ),
+              )
+            : null;
+
+        emit(
+          classified.type,
+          run.a,
+          run.b,
+          classified.confidence,
+          vote
+            ? {
+                hinge:
+                  vote.hinge,
+                swing:
+                  vote.swing,
+              }
+            : {},
+        );
       }
     }
   }
 
-  return mergeWindowPanes(
-    mergeOpenings(
-      openings,
-      hollowRectWindows(unionMask(wallInk, lightInk), w, h, graph, sx, sy),
-      graph.walls,
-    ),
+  return dedupeOpeningCandidates(
+    openings,
     graph.walls,
   );
 }
@@ -1209,7 +2344,7 @@ function mergeOpenings(
     if (!a) continue;
     const hit = kept.find((p) => {
       const b = mid(p);
-      return b !== null && Math.hypot(a[0] - b[0], a[1] - b[1]) < 0.55;
+      return b !== null && Math.hypot(a[0] - b[0], a[1] - b[1]) < 0.35;
     });
     if (hit) {
       if (o.type === "window" && hit.type !== "window") {
@@ -1263,8 +2398,8 @@ function sanitizeOpenings(
 
       // Use different limits for doors and windows,
       // but never use width to determine the opening type.
-      const minWidth = isWindow ? 0.4 : 0.7;
-      const preferredMaxWidth = isWindow ? 3.8 : 1.1;
+      const minWidth = isWindow ? 0.30 : 0.45;
+      const preferredMaxWidth = isWindow ? 4.2 : 1.7;
 
       const allowedMaxWidth = Math.min(
         preferredMaxWidth,
@@ -1367,6 +2502,233 @@ function annotateDoorSwings(
     );
     return { ...opening, hinge: vote.hinge, swing: vote.swing };
   });
+}
+
+
+function detectDoorSwingArc(
+  gray: Uint8Array,
+  lightInk: Uint8Array,
+  w: number,
+  h: number,
+  cx: number,
+  cy: number,
+  halfWidth: number,
+  dirX: number,
+  dirY: number,
+  normalX: number,
+  normalY: number,
+): number {
+
+  const radius =
+    Math.max(
+      8,
+      Math.min(
+        halfWidth * 2,
+        120,
+      ),
+    );
+
+  let best = 0;
+
+  /*
+   * A door can have its hinge on either side.
+   */
+  for (const hingeSide of [-1, 1]) {
+
+    const hx =
+      cx +
+      dirX *
+      halfWidth *
+      hingeSide;
+
+    const hy =
+      cy +
+      dirY *
+      halfWidth *
+      hingeSide;
+
+    /*
+     * And can swing toward either side of wall.
+     */
+    for (const swingSide of [-1, 1]) {
+
+      let hits = 0;
+      let samples = 0;
+
+      /*
+       * Quarter circle.
+       */
+      for (
+        let i = 0;
+        i <= 32;
+        i++
+      ) {
+        const angle =
+          (Math.PI / 2) *
+          (i / 32);
+
+        const x =
+          hx +
+          dirX *
+          Math.cos(angle) *
+          radius +
+          normalX *
+          swingSide *
+          Math.sin(angle) *
+          radius;
+
+        const y =
+          hy +
+          dirY *
+          Math.cos(angle) *
+          radius +
+          normalY *
+          swingSide *
+          Math.sin(angle) *
+          radius;
+
+        samples++;
+
+        if (
+          darkAt(
+            gray,
+            lightInk,
+            w,
+            h,
+            x,
+            y,
+          )
+        ) {
+          hits++;
+        }
+      }
+
+      const score =
+        hits /
+        Math.max(
+          1,
+          samples,
+        );
+
+      best =
+        Math.max(
+          best,
+          score,
+        );
+    }
+  }
+
+  /*
+   * Door arcs are usually sparse thin lines.
+   *
+   * Don't require 100% of samples.
+   */
+  return clamp(
+    best * 2.4,
+    0,
+    1,
+  );
+}
+
+function detectDoorLeaf(
+  gray: Uint8Array,
+  lightInk: Uint8Array,
+  w: number,
+  h: number,
+  cx: number,
+  cy: number,
+  halfWidth: number,
+  dirX: number,
+  dirY: number,
+  normalX: number,
+  normalY: number,
+): number {
+
+  let best = 0;
+
+  const radius =
+    Math.max(
+      8,
+      Math.min(
+        halfWidth * 2,
+        120,
+      ),
+    );
+
+  for (const hingeSide of [-1, 1]) {
+
+    const hx =
+      cx +
+      dirX *
+      halfWidth *
+      hingeSide;
+
+    const hy =
+      cy +
+      dirY *
+      halfWidth *
+      hingeSide;
+
+    for (const side of [-1, 1]) {
+
+      let hits = 0;
+      let samples = 0;
+
+      /*
+       * Look for a relatively straight leaf
+       * extending from the hinge.
+       */
+      for (
+        let r = 8;
+        r <= radius;
+        r += 3
+      ) {
+
+        const x =
+          hx +
+          normalX *
+          side *
+          r;
+
+        const y =
+          hy +
+          normalY *
+          side *
+          r;
+
+        samples++;
+
+        if (
+          darkAt(
+            gray,
+            lightInk,
+            w,
+            h,
+            x,
+            y,
+          )
+        ) {
+          hits++;
+        }
+      }
+
+      best =
+        Math.max(
+          best,
+          hits /
+          Math.max(
+            1,
+            samples,
+          ),
+        );
+    }
+  }
+
+  return clamp(
+    best * 2,
+    0,
+    1,
+  );
 }
 
 /** Count light ink in the four door-swing quarters; pick hinge + side of the arc. */
@@ -1540,6 +2902,7 @@ function splitInkLayers(
   gray: Uint8Array,
   ink: Uint8Array,
   invert: boolean,
+  protectedWallInk?: Uint8Array,
 ): { wall: Uint8Array; light: Uint8Array } {
   const hist = new Float64Array(256);
   let total = 0;
@@ -1556,11 +2919,22 @@ function splitInkLayers(
   let walls = 0;
   for (let i = 0; i < ink.length; i++) {
     if (!ink[i]) continue;
+
+    // Colored wall strokes are wall geometry even when their grayscale
+    // value is brighter than the Otsu split.
+    if (!invert && protectedWallInk?.[i]) {
+      wall[i] = 1;
+      walls++;
+      continue;
+    }
+
     const g = invert ? 255 - gray[i] : gray[i];
     if (g <= cut) {
       wall[i] = 1;
       walls++;
-    } else light[i] = 1;
+    } else {
+      light[i] = 1;
+    }
   }
   const frac = walls / total;
   if (frac < 0.18 || frac > 0.94) return { wall: ink, light: ink };
@@ -1581,7 +2955,11 @@ function scoreMask(mask: Uint8Array, w: number, h: number): number {
 
 function darkThreshold(gray: Uint8Array): number {
   const o = otsu(gray);
-  return Math.max(40, Math.min(o, 100));
+
+  // Architectural PDFs are often anti-aliased after rasterization. A hard
+  // cap at 100 drops medium-gray wall strokes. Keep enough gray ink for
+  // walls, while the long-line detector removes most text/noise later.
+  return Math.max(60, Math.min(o, 170));
 }
 
 function closeMask(mask: Uint8Array, w: number, h: number) {
@@ -1927,7 +3305,10 @@ function stripRuns(
         hits += mask[t * w + x];
       }
     }
-    dark[i] = n > 0 && hits / n > 0.42;
+    // PDF rasterization and thin CAD lines make the wall centerline less
+    // uniform than a scanned bitmap. 30% keeps real walls while preserving
+    // short opening gaps.
+    dark[i] = n > 0 && hits / n > 0.30;
   }
   const runs: { kind: "wall" | "gap"; a: number; b: number }[] = [];
   let i = 0;
@@ -2045,6 +3426,36 @@ function roomsByFlood(
     }
   }
   return spaces;
+}
+
+function darkAt(
+  gray: Uint8Array,
+  lightInk: Uint8Array,
+  w: number,
+  h: number,
+  x: number,
+  y: number,
+): boolean {
+
+  const ix = Math.round(x);
+  const iy = Math.round(y);
+
+  if (
+    ix < 0 ||
+    iy < 0 ||
+    ix >= w ||
+    iy >= h
+  ) {
+    return false;
+  }
+
+  const index =
+    iy * w + ix;
+
+  return (
+    gray[index] < 180 ||
+    lightInk[index] > 0
+  );
 }
 
 function guessName(area: number): string {

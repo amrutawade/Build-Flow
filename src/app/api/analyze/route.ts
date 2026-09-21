@@ -1,47 +1,143 @@
 import { NextResponse } from "next/server";
-import { analyzeImage } from "@/lib/pipeline";
-import { saneStoreyHeight } from "@/lib/geometry/storey";
+
+import {
+  graphFromPdf,
+} from "@/lib/vision/fromPdf";
+
+import {
+  graphFromImage,
+} from "@/lib/vision/fromImage";
+
+import {
+  writeIfc4,
+} from "@/lib/ifc/writeIfc4";
 
 export const runtime = "nodejs";
 
-export async function POST(req: Request) {
-  const form = await req.formData();
-  const file = form.get("file");
-  const storeyHeight = Number(form.get("storeyHeight") ?? 3);
-  const metersPerPixelRaw = form.get("metersPerPixel");
-  const metersPerPixel =
-    typeof metersPerPixelRaw === "string" && metersPerPixelRaw.length > 0
-      ? Number(metersPerPixelRaw)
-      : undefined;
+export async function POST(
+  req: Request,
+) {
+  try {
+    const form =
+      await req.formData();
 
-  if (!(file instanceof File)) {
-    return NextResponse.json({ error: "Missing file" }, { status: 400 });
-  }
+    const file =
+      form.get("file");
 
-  const name = file.name.toLowerCase();
-  if (name.endsWith(".pdf") || name.endsWith(".dxf")) {
+    if (
+      !(file instanceof File)
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            "No file uploaded.",
+        },
+        {
+          status: 400,
+        },
+      );
+    }
+
+    const buffer =
+      Buffer.from(
+        await file.arrayBuffer(),
+      );
+
+    const storeyHeightRaw =
+      form.get(
+        "storeyHeight",
+      );
+
+    const allPages = form.get("allPages") === "true";
+
+    const storeyHeight =
+      Number(
+        storeyHeightRaw ??
+          3,
+      );
+
+    if (
+      !Number.isFinite(
+        storeyHeight,
+      ) ||
+      storeyHeight <= 0
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            "storeyHeight must be a positive number.",
+        },
+        {
+          status: 400,
+        },
+      );
+    }
+
+    const fileName =
+      file.name.toLowerCase();
+
+    let graph;
+
+    if (
+      fileName.endsWith(
+        ".pdf",
+      )
+    ) {
+      graph =
+        await graphFromPdf(
+          buffer,
+          {
+            storeyHeight,
+
+            /*
+             * 2200 preserves small door/window
+             * symbols better than 1600.
+             */
+            rasterWorkMax:
+              2200,
+
+            /*
+             * Automatically use vector when
+             * useful native geometry exists.
+             */
+            preferVector:
+              true,
+            allPages,
+          },
+        );
+    } else {
+      graph =
+        await graphFromImage(
+          buffer,
+          {
+            storeyHeight,
+          },
+        );
+    }
+
+    const ifc =
+      writeIfc4(graph);
+
+    return NextResponse.json({
+      graph,
+      ifc,
+    });
+  } catch (error) {
+    console.error(
+      "Conversion failed:",
+      error,
+    );
+
     return NextResponse.json(
       {
         error:
-          "PDF/DXF are on the roadmap. Export a PNG/JPG of the plan for this build — geometry still comes from pixels, not an LLM.",
+          error instanceof Error
+            ? error.message
+            : "Conversion failed.",
       },
-      { status: 415 },
+      {
+        status: 500,
+      },
     );
   }
-
-  const buffer = Buffer.from(await file.arrayBuffer());
-  const { graph, report, preview } = await analyzeImage(buffer, {
-    storeyHeight: saneStoreyHeight(storeyHeight),
-    metersPerPixel:
-      metersPerPixel !== undefined && Number.isFinite(metersPerPixel)
-        ? metersPerPixel
-        : undefined,
-  });
-
-  return NextResponse.json({
-    graph,
-    report,
-    phase: "confirm",
-    png: `data:image/png;base64,${preview.toString("base64")}`,
-  });
 }

@@ -80,8 +80,12 @@ export function BuildingViewer({
     const root = new THREE.Group();
     scene.add(root);
 
-    const xs = graph.walls.flatMap((w) => [w.start[0], w.end[0]]);
-    const ys = graph.walls.flatMap((w) => [w.start[1], w.end[1]]);
+    const viewStoreys = graph.storeys?.length
+      ? graph.storeys
+      : [{ storeyName: graph.storeyName, elevation: 0, storeyHeight: graph.storeyHeight, walls: graph.walls, openings: graph.openings, spaces: graph.spaces }];
+    const allWalls = viewStoreys.flatMap(s => s.walls);
+    const xs = allWalls.flatMap((w) => [w.start[0], w.end[0]]);
+    const ys = allWalls.flatMap((w) => [w.start[1], w.end[1]]);
     const minX = Math.min(...xs, 0);
     const maxX = Math.max(...xs, 1);
     const minY = Math.min(...ys, 0);
@@ -132,7 +136,8 @@ export function BuildingViewer({
     }
 
     if (!planImage) {
-      for (const space of graph.spaces) {
+      for (const storey of viewStoreys) {
+      for (const space of storey.spaces) {
         if (space.polygon.length < 3) continue;
         const shape = new THREE.Shape();
         space.polygon.forEach((p, i) => {
@@ -146,7 +151,9 @@ export function BuildingViewer({
         geom.rotateX(-Math.PI / 2);
         root.add(new THREE.Mesh(geom, slabMat));
       }
-      for (const space of graph.spaces) {
+      }
+      for (const storey of viewStoreys) {
+      for (const space of storey.spaces) {
         const cxr =
           space.polygon.reduce((s, p) => s + p[0], 0) / space.polygon.length;
         const cyr =
@@ -155,21 +162,26 @@ export function BuildingViewer({
         sprite.position.set(cxr, 0.35, -cyr);
         root.add(sprite);
       }
+      }
     }
 
-    for (const wall of graph.walls) {
-      root.add(
-        wallGroup(wall, graph, {
+    for (const storey of viewStoreys) {
+      for (const wall of storey.walls) {
+        const floorGraph = { ...graph, storeyName: storey.storeyName, storeyHeight: storey.storeyHeight, walls: storey.walls, openings: storey.openings, spaces: storey.spaces };
+        const group = wallGroup(wall, floorGraph, {
           wall: wall.kind === "external" ? wallMatExt : wallMatInt,
           door: doorMat,
           frame: frameMat,
           glass: glassMat,
-        }, selectedId ?? null),
-      );
+        }, selectedId ?? null);
+        group.position.y += storey.elevation;
+        root.add(group);
+      }
     }
 
-    const target = new THREE.Vector3(cx, graph.storeyHeight * 0.2, -cy);
-    const span = Math.max(maxX - minX, maxY - minY, 8);
+    const totalHeight = viewStoreys.reduce((m, s) => Math.max(m, s.elevation + s.storeyHeight), graph.storeyHeight);
+    const target = new THREE.Vector3(cx, totalHeight * 0.35, -cy);
+    const span = Math.max(maxX - minX, maxY - minY, totalHeight * 1.5, 8);
     if (planImage) {
       camera.position.set(cx + span * 0.08, span * 0.95, -cy + span * 0.7);
     } else {

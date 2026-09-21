@@ -1,0 +1,60 @@
+import type { BuildingGraph } from "../models";
+import { polygonArea } from "../geometry/area";
+import { enrichGraph } from "../bim/catalog";
+import { saneStoreyHeight } from "./storey";
+
+/** Uniform scale about origin. Used when the user confirms a real-world length. */
+export function rescaleGraph(graph: BuildingGraph, factor: number): BuildingGraph {
+  if (!Number.isFinite(factor) || factor <= 0) return graph;
+  const walls = graph.walls.map((w) => ({
+    ...w,
+    start: [w.start[0] * factor, w.start[1] * factor] as [number, number],
+    end: [w.end[0] * factor, w.end[1] * factor] as [number, number],
+    thickness: w.thickness * factor,
+    length: (w.length ?? 0) * factor,
+  }));
+  const openings = graph.openings.map((o) => ({
+    ...o,
+    offset: o.offset * factor,
+    width: o.width * factor,
+    sill: o.sill * factor,
+  }));
+  const spaces = graph.spaces.map((s) => ({
+    ...s,
+    polygon: s.polygon.map(([x, y]) => [x * factor, y * factor] as [number, number]),
+    area: (s.area ?? polygonArea(s.polygon)) * factor * factor,
+  }));
+  const next: BuildingGraph = {
+    ...graph,
+    metersPerPixel: graph.metersPerPixel
+      ? graph.metersPerPixel * factor
+      : undefined,
+    imageOffsetX: (graph.imageOffsetX ?? 0) * factor,
+    imageOffsetY: (graph.imageOffsetY ?? 0) * factor,
+    walls,
+    openings,
+    spaces,
+  };
+  return enrichGraph(next);
+}
+
+export function setStoreyHeight(graph: BuildingGraph, height: number): BuildingGraph {
+  const h = saneStoreyHeight(height > 0.5 ? height : graph.storeyHeight);
+  return {
+    ...graph,
+    storeyHeight: h,
+    walls: graph.walls.map((w) => ({ ...w, height: h })),
+  };
+}
+
+export function excludeWall(graph: BuildingGraph, wallId: string): BuildingGraph {
+  return enrichGraph({
+    ...graph,
+    walls: graph.walls.filter((w) => w.id !== wallId),
+    openings: graph.openings.filter((o) => o.wallId !== wallId),
+    warnings: [
+      ...graph.warnings,
+      `Removed wall ${wallId}. Re-check room loops if this was structural.`,
+    ],
+  });
+}
