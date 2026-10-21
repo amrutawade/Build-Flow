@@ -24,17 +24,27 @@ const SURFACE = {
   slab: 0x8a8580,
 } as const;
 
-function collectOpenings(graph: BuildingGraph): Opening[] {
+
+function collectOpenings(
+  graph: Pick<BuildingGraph, "openings" | "doors" | "windows">
+): Opening[] {
   const byId = new Map<string, Opening>();
-  for (const o of graph.openings) byId.set(o.id, o);
+
+  for (const o of graph.openings) {
+    byId.set(o.id, o);
+  }
+
   for (const o of graph.doors ?? []) {
     byId.set(o.id, { ...o, type: "door" });
   }
+
   for (const o of graph.windows ?? []) {
     byId.set(o.id, { ...o, type: "window" });
   }
+
   return [...byId.values()];
 }
+
 
 class Writer {
   private nextId = 1;
@@ -169,7 +179,7 @@ class Writer {
       for (const space of storeyGraph.spaces) {
         productIds.push(this.writeSpace(space, storeyGraph.storeyHeight, oh, storeyPlacement, bodyCtx));
       }
-      const slab = this.writeSlab(storeyGraph as BuildingGraph, oh, storeyPlacement, bodyCtx);
+      const slab = this.writeSlab(storeyGraph, oh, storeyPlacement, bodyCtx);
       if (slab) productIds.push(slab);
       if (productIds.length) {
         this.emit(`IFCRELCONTAINEDINSPATIALSTRUCTURE(${this.guid(storeyGraph.storeyName)},#${oh},$,$,(${productIds.map(n => `#${n}`).join(",")}),#${storey})`);
@@ -428,45 +438,74 @@ class Writer {
     return spaceRef;
   }
 
+
   private writeSlab(
-    graph: BuildingGraph,
+    graph: StoreyGraph,
     oh: Ref,
     storeyPlacement: Ref,
     bodyCtx: Ref,
   ): Ref | null {
     if (graph.walls.length === 0) return null;
-    const xs = graph.walls.flatMap((w) => [w.start[0], w.end[0]]);
-    const ys = graph.walls.flatMap((w) => [w.start[1], w.end[1]]);
+  
+    const xs = graph.walls.flatMap((wall) => [
+      wall.start[0],
+      wall.end[0],
+    ]);
+  
+    const ys = graph.walls.flatMap((wall) => [
+      wall.start[1],
+      wall.end[1],
+    ]);
+  
     const minX = Math.min(...xs);
     const maxX = Math.max(...xs);
     const minY = Math.min(...ys);
     const maxY = Math.max(...ys);
-    const w = Math.max(0.5, maxX - minX + 0.4);
-    const d = Math.max(0.5, maxY - minY + 0.4);
-    const origin = this.pt3((minX + maxX) / 2, (minY + maxY) / 2, -0.12);
+  
+    const width = Math.max(0.5, maxX - minX + 0.4);
+    const depth = Math.max(0.5, maxY - minY + 0.4);
+  
+    const origin = this.pt3(
+      (minX + maxX) / 2,
+      (minY + maxY) / 2,
+      -0.12,
+    );
+  
     const axis = this.dir(0, 0, 1);
     const ref = this.dir(1, 0, 0);
+  
     const placement = this.emit(
       `IFCLOCALPLACEMENT(#${storeyPlacement},#${this.axis3(origin, axis, ref)})`,
     );
+  
     const profile = this.emit(
-      `IFCRECTANGLEPROFILEDEF(.AREA.,${this.str("SLAB")},#${this.axis2(this.pt2([0, 0]))},${fmt(w)},${fmt(d)})`,
+      `IFCRECTANGLEPROFILEDEF(.AREA.,${this.str("SLAB")},#${this.axis2(this.pt2([0, 0]))},${fmt(width)},${fmt(depth)})`,
     );
+  
     const solid = this.emit(
       `IFCEXTRUDEDAREASOLID(#${profile},#${this.axis3(this.pt3(0, 0, 0))},#${this.dir(0, 0, 1)},${fmt(0.12)})`,
     );
+  
     const look = this.appearance("Floor slab", SURFACE.slab, bodyCtx);
     this.paintSolid(solid, look.style);
+  
     const shape = this.emit(
       `IFCSHAPEREPRESENTATION(#${bodyCtx},${this.str("Body")},${this.str("SweptSolid")},(#${solid}))`,
     );
-    const def = this.emit(`IFCPRODUCTDEFINITIONSHAPE($,$,(#${shape}))`);
+  
+    const def = this.emit(
+      `IFCPRODUCTDEFINITIONSHAPE($,$,(#${shape}))`,
+    );
+  
     const slabRef = this.emit(
       `IFCSLAB(${this.guid()},#${oh},${this.str("Floor")},${this.str("Storey slab")},$,#${placement},#${def},$,.FLOOR.)`,
     );
+  
     this.assignMaterial(slabRef, look.material);
+  
     return slabRef;
   }
+  
 
   serialize(): string {
     return [
