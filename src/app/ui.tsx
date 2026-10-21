@@ -22,8 +22,8 @@ type Phase = "empty" | "confirm" | "solved";
 // GitHub Pages hosts this project under /Build-Flow.
 const DEFAULT_PLAN_IMAGE =
   process.env.NODE_ENV === "production"
-    ? "studio.png"
-    : "studio.png";
+    ? "/images/studio.png"
+    : "/images/1Bhk.png";
 
 export function Converter() {
   const [graph, setGraph] = useState<BuildingGraph | null>(null);
