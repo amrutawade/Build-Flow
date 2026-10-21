@@ -3,6 +3,8 @@ import { sampleTwoBhk } from "@/lib/samples/twoBhk";
 import { samplePng, sampleSvg, PLAN_MARGIN } from "@/lib/samples/renderPlan";
 import { solveGraph } from "@/lib/pipeline";
 import { enrichGraph } from "@/lib/bim/catalog";
+export const dynamic = "force-static";
+export const revalidate = false;
 
 export async function GET() {
   const graph = enrichGraph(sampleTwoBhk());

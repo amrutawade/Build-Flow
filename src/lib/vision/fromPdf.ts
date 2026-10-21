@@ -178,11 +178,11 @@ import type {
         ),
       );
   
-    vector.imageCount =
-      ops.fnArray.filter(
-        (fn) =>
-          imageFns.has(fn),
-      ).length;
+  
+    vector.imageCount = ops.fnArray.filter(
+      (fn: number) => imageFns.has(fn),
+    ).length;
+
 
     vector.textItems = textItems;
   

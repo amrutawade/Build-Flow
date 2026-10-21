@@ -1373,6 +1373,15 @@ function singleLineWalls(lines: PdfLine[], page: PdfVectorPage, paired: WallCand
   return out;
 }
 
+
+function lineLength(line: PdfLine): number {
+  return Math.hypot(
+    line.b[0] - line.a[0],
+    line.b[1] - line.a[1],
+  );
+}
+
+
 function dedupeWalls(walls: WallCandidate[]): WallCandidate[] {
   const sorted = [...walls].sort((a, b) => b.confidence - a.confidence);
   const out: WallCandidate[] = [];
