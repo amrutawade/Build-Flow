@@ -18,10 +18,17 @@ import { BuildingViewer } from "./BuildingViewer";
 
 type Phase = "empty" | "confirm" | "solved";
 
+// The default image is served from /public/default.png.
+// GitHub Pages hosts this project under /Build-Flow.
+const DEFAULT_PLAN_IMAGE =
+  process.env.NODE_ENV === "production"
+    ? "studio.png"
+    : "studio.png";
+
 export function Converter() {
   const [graph, setGraph] = useState<BuildingGraph | null>(null);
   const [ifc, setIfc] = useState<string>("");
-  const [preview, setPreview] = useState<string>("");
+  const [preview, setPreview] = useState<string>(DEFAULT_PLAN_IMAGE);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>("");
   const [storeyHeight, setStoreyHeightM] = useState(3);
