@@ -59,3 +59,7 @@ Skewed phone photos, dimension ticks read as walls, missing printed scale, door 
 | `POST` | `/api/solve` | Confirmed graph → IFC + report |
 | `POST` | `/api/export` | Graph → `.ifc` download |
 | `POST` | `/api/convert` | Analyze + solve in one call |
+
+
+## Video 
+[text](<../../../Desktop/Screen Recording 2026-09-04 at 1.26.43 PM.mov>)
