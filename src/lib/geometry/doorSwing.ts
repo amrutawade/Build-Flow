@@ -6,27 +6,55 @@ export function wallNormal(wall: Wall): Vec2 {
   return [-uy, ux];
 }
 
-/** Open-leaf endpoint in plan, 90° from the hinged jamb toward `opening.swing`. */
-export function doorLeafEnd(opening: Opening, wall: Wall): Vec2 {
+export function doorHingePoint(
+  opening: Opening,
+  wall: Wall,
+): Vec2 {
   const { ux, uy } = wallFrame(wall);
-  const [nx, ny] = wallNormal(wall);
-  const hingeStart = opening.hinge !== "end";
-  const t = hingeStart ? opening.offset : opening.offset + opening.width;
-  const sign = opening.swing ?? 1;
+
+  const t =
+    opening.hinge === "end"
+      ? opening.offset + opening.width
+      : opening.offset;
+
   return [
-    wall.start[0] + ux * t + nx * sign * opening.width,
-    wall.start[1] + uy * t + ny * sign * opening.width,
+    wall.start[0] + ux * t,
+    wall.start[1] + uy * t,
   ];
 }
 
-export function doorHingePoint(opening: Opening, wall: Wall): Vec2 {
+export function doorStrikePoint(
+  opening: Opening,
+  wall: Wall,
+): Vec2 {
   const { ux, uy } = wallFrame(wall);
-  const t = opening.hinge === "end" ? opening.offset + opening.width : opening.offset;
-  return [wall.start[0] + ux * t, wall.start[1] + uy * t];
+
+  const t =
+    opening.hinge === "end"
+      ? opening.offset
+      : opening.offset + opening.width;
+
+  return [
+    wall.start[0] + ux * t,
+    wall.start[1] + uy * t,
+  ];
 }
 
-export function doorStrikePoint(opening: Opening, wall: Wall): Vec2 {
-  const { ux, uy } = wallFrame(wall);
-  const t = opening.hinge === "end" ? opening.offset : opening.offset + opening.width;
-  return [wall.start[0] + ux * t, wall.start[1] + uy * t];
+/**
+ * End point of the opened door leaf.
+ * The leaf rotates 90° around the hinge.
+ */
+export function doorLeafEnd(
+  opening: Opening,
+  wall: Wall,
+): Vec2 {
+  const hinge = doorHingePoint(opening, wall);
+  const [nx, ny] = wallNormal(wall);
+
+  const swing = opening.swing === -1 ? -1 : 1;
+
+  return [
+    hinge[0] + nx * swing * opening.width,
+    hinge[1] + ny * swing * opening.width,
+  ];
 }

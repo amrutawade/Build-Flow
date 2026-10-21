@@ -1,0 +1,11 @@
+export type Vec2 = [number, number];
+export type PdfLine = { a: Vec2; b: Vec2; width: number; color?: [number, number, number]; opIndex: number };
+export type PdfRect = { x: number; y: number; width: number; height: number; strokeWidth: number; filled: boolean; color?: [number, number, number]; opIndex: number };
+export type PdfVectorStats = { pageWidth:number; pageHeight:number; lineCount:number; rectCount:number; longLineCount:number; longRectCount:number; textCount:number; imageCount:number; usefulVectorGeometry:boolean };
+export function isAxisAligned(a:Vec2,b:Vec2,tolerance=0.985){const dx=Math.abs(b[0]-a[0]),dy=Math.abs(b[1]-a[1]),len=Math.hypot(dx,dy)||1;return Math.max(dx,dy)/len>=tolerance;}
+export function lineLength(line:PdfLine){return Math.hypot(line.b[0]-line.a[0],line.b[1]-line.a[1]);}
+export function rectLongSide(r:PdfRect){return Math.max(Math.abs(r.width),Math.abs(r.height));}
+export function rectShortSide(r:PdfRect){return Math.min(Math.abs(r.width),Math.abs(r.height));}
+export function wallScore(line:PdfLine,pageWidth:number,pageHeight:number){const len=lineLength(line),span=Math.max(pageWidth,pageHeight),relative=Math.min(1,len/Math.max(1,span*.08));return Math.min(.98,.3+relative*.45+(isAxisAligned(line.a,line.b)? .2:0)+Math.min(1,Math.max(0,line.width/3))*.05);}
+export function rectangleWallScore(r:PdfRect,pageWidth:number,pageHeight:number){const long=rectLongSide(r),short=rectShortSide(r);if(short<=0||long<=0||long/short<4)return 0;const relative=Math.min(1,long/Math.max(1,Math.max(pageWidth,pageHeight)*.08));return Math.min(.96,.35+relative*.4+Math.min(1,(long/short-4)/8)*.2);}
+export function classifyOpeningEvidence(args:{gap:number;adjacentLineCount:number;perpendicularLineCount:number;arcLike?:boolean;parallelPair?:boolean;windowWidth?:number}){const {gap}=args;if(gap<.25||gap>4.5)return null;const door=(args.arcLike?.48:0)+Math.min(.3,args.perpendicularLineCount*.08)+Math.min(.2,args.adjacentLineCount*.05);const win=(args.parallelPair?.48:0)+Math.min(.25,args.perpendicularLineCount*.06)+(args.windowWidth!==undefined&&args.windowWidth>=.5&&args.windowWidth<=3.5?.2:0);const best=Math.max(door,win);if(best<.34)return null;return door>=win?{type:"door" as const,confidence:Math.min(.94,Math.max(.46,door))}:{type:"window" as const,confidence:Math.min(.94,Math.max(.46,win))};}

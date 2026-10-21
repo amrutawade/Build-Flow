@@ -27,6 +27,7 @@ export function Converter() {
   const [storeyHeight, setStoreyHeightM] = useState(3);
   const [metersPerPixel, setMetersPerPixel] = useState("");
   const [knownLength, setKnownLength] = useState("");
+  const [allPages, setAllPages] = useState(true);
   const [view, setView] = useState<"3d" | "2d">("3d");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("empty");
@@ -53,6 +54,43 @@ export function Converter() {
     setPreview(url);
   }
 
+  function debugOpenings(label: string, graph: BuildingGraph | null) {
+    if (!graph) return;
+  
+    const doors = graph.openings.filter((o) => o.type === "door");
+    const windows = graph.openings.filter((o) => o.type === "window");
+  
+    const orphanOpenings = graph.openings.filter(
+      (o) => !graph.walls.some((w) => w.id === o.wallId),
+    );
+  
+    console.group(`[${label}]`);
+  
+    console.log("Walls:", graph.walls.length);
+    console.log("Openings:", graph.openings.length);
+    console.log("Doors:", doors.length);
+    console.log("Windows:", windows.length);
+  
+    console.table(
+      doors.map((d) => ({
+        id: d.id,
+        wallId: d.wallId,
+        offset: d.offset,
+        width: d.width,
+        height: d.height,
+        confidence: d.confidence,
+        hinge: d.hinge,
+        swing: d.swing,
+      })),
+    );
+  
+    if (orphanOpenings.length) {
+      console.warn("ORPHAN OPENINGS:", orphanOpenings);
+    }
+  
+    console.groupEnd();
+  }
+
   function beginNewSource() {
     loadGen.current += 1;
     setSourceKey((k) => k + 1);
@@ -69,16 +107,26 @@ export function Converter() {
 
   const stats = useMemo(() => {
     if (!graph) return null;
+  
     const area = graph.spaces.reduce(
       (s, sp) => s + (sp.area ?? polygonArea(sp.polygon)),
       0,
     );
+  
+    const doors = graph.openings.filter((o) => o.type === "door");
+    const windows = graph.openings.filter((o) => o.type === "window");
+  
+    const orphanOpenings = graph.openings.filter(
+      (o) => !graph.walls.some((w) => w.id === o.wallId),
+    );
+  
     return {
       walls: graph.walls.length,
       openings: graph.openings.length,
-      doors: graph.doors?.length ?? graph.openings.filter((o) => o.type === "door").length,
-      windows: graph.windows?.length ?? graph.openings.filter((o) => o.type === "window").length,
+      doors: doors.length,
+      windows: windows.length,
       spaces: graph.spaces.length,
+      orphanOpenings: orphanOpenings.length,
       area,
     };
   }, [graph]);
@@ -105,7 +153,10 @@ export function Converter() {
       const res = await fetch("/api/sample", { cache: "no-store" });
       const data = await res.json();
       if (gen !== loadGen.current) return;
-      setGraph(enrichGraph(data.graph));
+      const analyzedGraph = enrichGraph(data.graph);
+      debugOpenings("AFTER ANALYZE", analyzedGraph);
+
+      setGraph(analyzedGraph);
       setIfc(data.ifc);
       showPreview(data.png);
       setPhase("solved");
@@ -130,6 +181,7 @@ export function Converter() {
       form.set("file", file);
       form.set("storeyHeight", String(storeyHeight >= 2.4 ? storeyHeight : 3));
       if (metersPerPixel) form.set("metersPerPixel", metersPerPixel);
+      if (file.name.toLowerCase().endsWith(".pdf")) form.set("allPages", String(allPages));
       const res = await fetch("/api/analyze", {
         method: "POST",
         body: form,
@@ -141,7 +193,10 @@ export function Converter() {
       if (typeof data.png === "string" && data.png.startsWith("data:")) {
         showPreview(data.png);
       }
-      setGraph(enrichGraph(data.graph));
+      const analyzedGraph = enrichGraph(data.graph);
+      debugOpenings("AFTER ANALYZE", analyzedGraph);
+
+      setGraph(analyzedGraph);
       setStoreyHeightM(Number(data.graph?.storeyHeight) > 2.3 ? data.graph.storeyHeight : 3);
       setPhase("confirm");
       setReport(data.report ?? null);
@@ -276,7 +331,11 @@ export function Converter() {
 
       <div className="row">
         <aside className="panel">
-          <label htmlFor="height">Storey height (m)</label>
+                      <label className="field-row" style={{ marginTop: 8 }}>
+              <input type="checkbox" checked={allPages} onChange={e => setAllPages(e.target.checked)} />
+              <span>PDF: process all pages as storeys</span>
+            </label>
+<label htmlFor="height">Storey height (m)</label>
           <input
             id="height"
             type="number"

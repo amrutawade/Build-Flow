@@ -2,7 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
-import type { BuildingGraph, Wall } from "@/lib/models";
+import type { BuildingGraph, Opening, Wall } from "@/lib/models";
 import { wallFrame } from "@/lib/geometry/frame";
 import { wallBoxes } from "@/lib/geometry/wallBoxes";
 import { overlayCenter } from "@/lib/geometry/imageMap";
@@ -80,8 +80,12 @@ export function BuildingViewer({
     const root = new THREE.Group();
     scene.add(root);
 
-    const xs = graph.walls.flatMap((w) => [w.start[0], w.end[0]]);
-    const ys = graph.walls.flatMap((w) => [w.start[1], w.end[1]]);
+    const viewStoreys = graph.storeys?.length
+      ? graph.storeys
+      : [{ storeyName: graph.storeyName, elevation: 0, storeyHeight: graph.storeyHeight, walls: graph.walls, openings: graph.openings, spaces: graph.spaces }];
+    const allWalls = viewStoreys.flatMap(s => s.walls);
+    const xs = allWalls.flatMap((w) => [w.start[0], w.end[0]]);
+    const ys = allWalls.flatMap((w) => [w.start[1], w.end[1]]);
     const minX = Math.min(...xs, 0);
     const maxX = Math.max(...xs, 1);
     const minY = Math.min(...ys, 0);
@@ -132,7 +136,8 @@ export function BuildingViewer({
     }
 
     if (!planImage) {
-      for (const space of graph.spaces) {
+      for (const storey of viewStoreys) {
+      for (const space of storey.spaces) {
         if (space.polygon.length < 3) continue;
         const shape = new THREE.Shape();
         space.polygon.forEach((p, i) => {
@@ -146,7 +151,9 @@ export function BuildingViewer({
         geom.rotateX(-Math.PI / 2);
         root.add(new THREE.Mesh(geom, slabMat));
       }
-      for (const space of graph.spaces) {
+      }
+      for (const storey of viewStoreys) {
+      for (const space of storey.spaces) {
         const cxr =
           space.polygon.reduce((s, p) => s + p[0], 0) / space.polygon.length;
         const cyr =
@@ -155,21 +162,26 @@ export function BuildingViewer({
         sprite.position.set(cxr, 0.35, -cyr);
         root.add(sprite);
       }
+      }
     }
 
-    for (const wall of graph.walls) {
-      root.add(
-        wallGroup(wall, graph, {
+    for (const storey of viewStoreys) {
+      for (const wall of storey.walls) {
+        const floorGraph = { ...graph, storeyName: storey.storeyName, storeyHeight: storey.storeyHeight, walls: storey.walls, openings: storey.openings, spaces: storey.spaces };
+        const group = wallGroup(wall, floorGraph, {
           wall: wall.kind === "external" ? wallMatExt : wallMatInt,
           door: doorMat,
           frame: frameMat,
           glass: glassMat,
-        }, selectedId ?? null),
-      );
+        }, selectedId ?? null);
+        group.position.y += storey.elevation;
+        root.add(group);
+      }
     }
 
-    const target = new THREE.Vector3(cx, graph.storeyHeight * 0.2, -cy);
-    const span = Math.max(maxX - minX, maxY - minY, 8);
+    const totalHeight = viewStoreys.reduce((m, s) => Math.max(m, s.elevation + s.storeyHeight), graph.storeyHeight);
+    const target = new THREE.Vector3(cx, totalHeight * 0.35, -cy);
+    const span = Math.max(maxX - minX, maxY - minY, totalHeight * 1.5, 8);
     if (planImage) {
       camera.position.set(cx + span * 0.08, span * 0.95, -cy + span * 0.7);
     } else {
@@ -343,25 +355,81 @@ function wallGroup(
     group.add(left, right, head);
 
     if (opening.type === "door") {
-      const leafW = Math.min(0.95, Math.max(0.55, opening.width - 0.06));
-      const leafH = Math.max(0.2, opening.height - 0.08);
-      const hingeStart = opening.hinge !== "end";
-      const sign = opening.swing ?? 1;
+      const leafW = Math.min(
+        0.95,
+        Math.max(0.55, opening.width - 0.06),
+      );
+    
+      const leafH = Math.max(
+        0.2,
+        opening.height - 0.08,
+      );
+    
+      const hingeAtEnd = opening.hinge === "end";
+      const swing = opening.swing === -1 ? -1 : 1;
+    
+      const hingeX = hingeAtEnd
+        ? opening.offset + opening.width - 0.04
+        : opening.offset + 0.04;
+    
       const pivot = new THREE.Group();
+    
       pivot.position.set(
-        hingeStart ? opening.offset + 0.04 : opening.offset + opening.width - 0.04,
+        hingeX,
         opening.sill + leafH / 2,
         0,
       );
+    
       const leaf = new THREE.Mesh(
-        new THREE.BoxGeometry(leafW, leafH, 0.045),
-        pickMat(mats.door, opening.id, selectedId),
+        new THREE.BoxGeometry(
+          leafW,
+          leafH,
+          0.045,
+        ),
+        pickMat(
+          mats.door,
+          opening.id,
+          selectedId,
+        ),
       );
-      leaf.position.set(hingeStart ? leafW / 2 : -leafW / 2, 0, 0);
+    
+      leaf.position.x = hingeAtEnd
+        ? -leafW / 2
+        : leafW / 2;
+    
       leaf.userData.entityId = opening.id;
-      pivot.rotation.y = (hingeStart ? 1 : -1) * sign * (Math.PI / 2) * 0.92;
+    
+      /*
+       * Wall local X = along the wall.
+       * Wall local Z = perpendicular to the wall.
+       *
+       * Because the wall group is already rotated to wall direction,
+       * rotate the door around its hinge in local coordinates.
+       */
+      const direction = hingeAtEnd ? -1 : 1;
+    
+      pivot.rotation.y =
+        direction *
+        swing *
+        (Math.PI / 2);
+    
       pivot.add(leaf);
       group.add(pivot);
+    
+      // Draw the door swing arc.
+      const arc = doorSwingArc(
+        opening,
+        hingeX,
+        leafH / 2,
+        leafW,
+        hingeAtEnd,
+        swing,
+        mats.frame,
+      );
+    
+      arc.userData.entityId = opening.id;
+      group.add(arc);
+
     } else {
       const glass = new THREE.Mesh(
         new THREE.BoxGeometry(opening.width - 0.08, opening.height - 0.08, 0.04),
@@ -386,6 +454,68 @@ function wallGroup(
   }
 
   return group;
+}
+
+function doorSwingArc(
+  opening: Opening,
+  hingeX: number,
+  y: number,
+  radius: number,
+  hingeAtEnd: boolean,
+  swing: number,
+  material: THREE.Material,
+): THREE.Line {
+  const points: THREE.Vector3[] = [];
+
+  const segments = 24;
+
+  /*
+   * Door starts along the wall.
+   *
+   * For hinge at start:
+   *   leaf points +X
+   *
+   * For hinge at end:
+   *   leaf points -X
+   */
+  const baseAngle = hingeAtEnd
+    ? Math.PI
+    : 0;
+
+  /*
+   * Three.js local Y rotation:
+   * X -> Z depending on the rotation direction.
+   *
+   * Use opposite sign because plan Y is represented by -Z.
+   */
+  const direction = swing === -1 ? -1 : 1;
+
+  for (let i = 0; i <= segments; i++) {
+    const t = i / segments;
+
+    const angle =
+      baseAngle +
+      direction * t * (Math.PI / 2);
+
+    points.push(
+      new THREE.Vector3(
+        hingeX + Math.cos(angle) * radius,
+        y,
+        Math.sin(angle) * radius,
+      ),
+    );
+  }
+
+  const geometry =
+    new THREE.BufferGeometry().setFromPoints(points);
+
+  return new THREE.Line(
+    geometry,
+    new THREE.LineBasicMaterial({
+      color: 0xd6b36a,
+      linewidth: 2,
+    }),
+  );
 }
 
 function pickMat(

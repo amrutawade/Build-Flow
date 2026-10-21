@@ -179,13 +179,13 @@ function colinearGroups(walls: Wall[], tol = 0.18): Wall[][] {
 function spanOf(wall: Wall, horiz: boolean) {
   return horiz
     ? {
-        a: Math.min(wall.start[0], wall.end[0]),
-        b: Math.max(wall.start[0], wall.end[0]),
-      }
+      a: Math.min(wall.start[0], wall.end[0]),
+      b: Math.max(wall.start[0], wall.end[0]),
+    }
     : {
-        a: Math.min(wall.start[1], wall.end[1]),
-        b: Math.max(wall.start[1], wall.end[1]),
-      };
+      a: Math.min(wall.start[1], wall.end[1]),
+      b: Math.max(wall.start[1], wall.end[1]),
+    };
 }
 
 function wallFromSpan(src: Wall, horiz: boolean, a: number, b: number): Wall {
@@ -206,6 +206,17 @@ function wallFromSpan(src: Wall, horiz: boolean, a: number, b: number): Wall {
     end: startFirst ? [x, b] : [x, a],
   };
 }
+
+function averageThickness(a: Wall, b: Wall): number {
+  const la = wallFrame(a).length;
+  const lb = wallFrame(b).length;
+
+  return (
+    (a.thickness * la + b.thickness * lb) /
+    Math.max(la + lb, 1e-6)
+  );
+}
+
 
 /**
  * Join colinear fragments across door/window gaps so the opening is hosted
@@ -234,16 +245,16 @@ function bridgeColinearOpenings(walls: Wall[]): { walls: Wall[]; openings: Openi
         const external = isExternalWall(wall, box, 0.55);
         const isWindow = width >= 0.9 && external;
         if (!isWindow && (width < 0.55 || width > 1.2)) continue;
-        openings.push({
-          id: `${isWindow ? "WIN" : "D"}-g${n++}`,
-          type: isWindow ? "window" : "door",
-          wallId: wall.id,
-          offset: Math.max(0, offset),
-          width,
-          height: isWindow ? 1.2 : 2.1,
-          sill: isWindow ? 0.9 : 0,
-          confidence: 0.7,
-        });
+        // openings.push({
+        //   id: `${isWindow ? "WIN" : "D"}-g${n++}`,
+        //   type: isWindow ? "window" : "door",
+        //   wallId: wall.id,
+        //   offset: Math.max(0, offset),
+        //   width,
+        //   height: isWindow ? 1.2 : 2.1,
+        //   sill: isWindow ? 0.9 : 0,
+        //   confidence: 0.7,
+        // });
       }
     };
 
@@ -258,18 +269,54 @@ function bridgeColinearOpenings(walls: Wall[]): { walls: Wall[]; openings: Openi
       const windowLike = gap > 1.2 && gap <= 3.8 && external;
       if (gap < -0.04) {
         cur.b = Math.max(cur.b, next.b);
-        if (wallFrame(next.w).length > wallFrame(cur.w).length) cur.w = next.w;
+        const mergedThickness = averageThickness(cur.w, next.w);
+
+        if (wallFrame(next.w).length > wallFrame(cur.w).length) {
+          cur.w = {
+            ...next.w,
+            thickness: mergedThickness,
+          };
+        } else {
+          cur.w = {
+            ...cur.w,
+            thickness: mergedThickness,
+          };
+        }
       } else if (
         gap >= 0.04 &&
         gap < 0.55 &&
         !tAtSpan(walls, horiz, pos, cur.b, next.a)
       ) {
         cur.b = next.b;
-        if (wallFrame(next.w).length > wallFrame(cur.w).length) cur.w = next.w;
+        const mergedThickness = averageThickness(cur.w, next.w);
+
+        if (wallFrame(next.w).length > wallFrame(cur.w).length) {
+          cur.w = {
+            ...next.w,
+            thickness: mergedThickness,
+          };
+        } else {
+          cur.w = {
+            ...cur.w,
+            thickness: mergedThickness,
+          };
+        }
       } else if (doorLike || windowLike) {
         cur.holes.push({ a: cur.b, b: next.a });
         cur.b = next.b;
-        if (wallFrame(next.w).length > wallFrame(cur.w).length) cur.w = next.w;
+        const mergedThickness = averageThickness(cur.w, next.w);
+
+        if (wallFrame(next.w).length > wallFrame(cur.w).length) {
+          cur.w = {
+            ...next.w,
+            thickness: mergedThickness,
+          };
+        } else {
+          cur.w = {
+            ...cur.w,
+            thickness: mergedThickness,
+          };
+        }
       } else {
         flush();
         cur = { w: next.w, a: next.a, b: next.b, holes: [] };
@@ -301,52 +348,409 @@ function tAtSpan(
 }
 
 /** Snap endpoints, close T-junctions, split crossings, rehost openings. */
-export function repairTopology(graph: BuildingGraph): BuildingGraph {
+export function repairTopology(
+  graph: BuildingGraph,
+): BuildingGraph {
   const snap = snapToleranceMeters(graph);
-  const aligned = pinOntoCrossings(
-    extendToJunctions(snapOrthogonal(graph.walls, Math.min(snap, 0.1)), 0.55),
-    Math.max(snap, 0.12),
+
+  // Keep topology repair conservative.
+  // 30-50 mm is the tolerance for actual connectivity.
+  const endpointTol = Math.min(
+    Math.max(snap, 0.03),
+    0.05,
   );
-  const walls: Wall[] = aligned.map((w) => ({ ...w }));
 
-  const split = splitAtCrossings(splitAtJunctions(walls, Math.max(snap, 0.06)));
-  const extended = extendToJunctions(split, 0.55);
-  let joined = extended.filter((w) => dist(w.start, w.end) > 0.05);
-  joined = sealWallNetwork(joined);
-  const bridged = bridgeColinearOpenings(joined);
-  const cleaned = sealWallNetwork(bridged.walls);
-  const fromVision = rehostOpenings(graph.walls, cleaned, graph.openings);
-  const openings = dedupeOpenings(
-    [...fromVision, ...bridged.openings],
+  const junctionTol = Math.min(
+    Math.max(snap, 0.03),
+    0.05,
+  );
+
+  const aligned = pinOntoCrossings(
+    extendToJunctions(
+      snapOrthogonal(
+        graph.walls,
+        endpointTol,
+      ),
+      0.10,
+    ),
+    endpointTol,
+  );
+
+  const walls: Wall[] = aligned.map((w) => ({
+    ...w,
+  }));
+
+  // Split actual intersections/T-junctions.
+  const split = splitAtCrossings(
+    splitAtJunctions(
+      walls,
+      junctionTol,
+    ),
+  );
+
+  // Small controlled extension only.
+  const extended = extendToJunctions(
+    split,
+    0.10,
+  );
+
+  let cleaned = extended.filter(
+    (w) =>
+      dist(w.start, w.end) > 0.05,
+  );
+
+  // Seal only very small topology gaps.
+  cleaned = sealWallNetwork(
     cleaned,
-  ).filter(
-    (opening) => {
-      const host = cleaned.find((w) => w.id === opening.wallId);
-      if (!host) return false;
-      const len = wallFrame(host).length;
-      const maxW = opening.type === "window" ? 3.8 : 1.3;
-      const minW = opening.type === "window" ? 0.35 : 0.5;
-      if (opening.width < minW || opening.width > maxW) return false;
-      return opening.offset + opening.width <= len + 0.12;
-    },
-  ).map((opening) => {
-    const host = cleaned.find((w) => w.id === opening.wallId)!;
-    const len = wallFrame(host).length;
-    const width = Math.min(opening.width, len - 0.05);
-    const offset = Math.max(0, Math.min(opening.offset, Math.max(0, len - width)));
-    const isWindow = opening.type === "window";
-    return {
-      ...opening,
-      offset,
-      width,
-      type: isWindow ? ("window" as const) : ("door" as const),
-      height: isWindow ? opening.height || 1.2 : opening.height || 2.1,
-      sill: isWindow ? opening.sill || 0.9 : 0,
-    };
-  });
+  );
 
-  const padded = padHostsToCorners(cleaned, openings);
-  return { ...graph, walls: padded.walls, openings: padded.openings };
+  /*
+   * IMPORTANT:
+   *
+   * Do NOT call bridgeColinearOpenings().
+   *
+   * A gap does not mean door/window.
+   */
+  const fromVision = rehostOpenings(
+    graph.walls,
+    cleaned,
+    graph.openings,
+  );
+  const openings = dedupeOpenings(
+    fromVision,
+    cleaned,
+  )
+    .map((opening) => {
+      const host = cleaned.find(
+        (w) => w.id === opening.wallId,
+      );
+
+      if (!host) {
+        return null;
+      }
+
+      const frame = wallFrame(host);
+      const len = frame.length;
+
+      /*
+       * Keep the detected opening width.
+       *
+       * Only clamp obviously impossible values.
+       */
+      const width = Math.max(
+        0.05,
+        Math.min(
+          opening.width,
+          len,
+        ),
+      );
+
+      /*
+       * Rehost the opening using its center.
+       *
+       * This is safer than simply clamping the old offset because
+       * topology repair may have changed the wall start point.
+       */
+      const oldCenter =
+        opening.offset +
+        opening.width / 2;
+
+      const oldWall =
+        graph.walls.find(
+          (w) =>
+            w.id === opening.wallId,
+        );
+
+      let offset = opening.offset;
+
+      if (oldWall) {
+        const oldFrame =
+          wallFrame(oldWall);
+
+        const centerX =
+          oldWall.start[0] +
+          oldFrame.ux *
+          oldCenter;
+
+        const centerY =
+          oldWall.start[1] +
+          oldFrame.uy *
+          oldCenter;
+
+        /*
+         * Project the old opening center onto
+         * the repaired wall.
+         */
+        const dx =
+          centerX -
+          host.start[0];
+
+        const dy =
+          centerY -
+          host.start[1];
+
+        const projected =
+          dx * frame.ux +
+          dy * frame.uy;
+
+        offset =
+          projected -
+          width / 2;
+      }
+
+      offset = Math.max(
+        0,
+        Math.min(
+          offset,
+          Math.max(
+            0,
+            len - width,
+          ),
+        ),
+      );
+
+      return {
+        ...opening,
+
+        wallId: host.id,
+
+        offset,
+
+        width,
+
+        height:
+          opening.height > 0
+            ? opening.height
+            : opening.type ===
+              "window"
+              ? 1.2
+              : 2.1,
+
+        sill:
+          opening.type ===
+            "window"
+            ? opening.sill >= 0
+              ? opening.sill
+              : 0.9
+            : 0,
+
+        /*
+         * Slightly increase confidence because the opening
+         * survived topology rehosting.
+         */
+        confidence:
+          Math.min(
+            0.99,
+            Math.max(
+              opening.confidence,
+              0.55,
+            ),
+          ),
+      };
+    })
+    .filter(
+      (
+        opening,
+      ): opening is Opening =>
+        opening !== null,
+    );
+
+  const padded = padHostsToCorners(
+    cleaned,
+    openings,
+  );
+
+  return {
+    ...graph,
+    walls: padded.walls,
+    openings: padded.openings,
+  };
+}
+
+function rehostOpenings(
+  oldWalls: Wall[],
+  newWalls: Wall[],
+  openings: Opening[],
+): Opening[] {
+  const result: Opening[] = [];
+
+  for (const opening of openings) {
+    const oldWall = oldWalls.find(
+      (wall) =>
+        wall.id === opening.wallId,
+    );
+
+    if (!oldWall) {
+      /*
+       * The original wall may have disappeared during topology
+       * repair. Try to find the closest compatible wall using
+       * the opening's original position.
+       */
+      const recovered =
+        recoverOpeningHost(
+          opening,
+          oldWalls,
+          newWalls,
+        );
+
+      if (recovered) {
+        result.push(recovered);
+      }
+
+      continue;
+    }
+
+    const oldFrame =
+      wallFrame(oldWall);
+
+    const oldCenter =
+      opening.offset +
+      opening.width / 2;
+
+    /*
+     * Convert the opening center into world coordinates.
+     */
+    const center: Vec2 = [
+      oldWall.start[0] +
+      oldFrame.ux *
+      oldCenter,
+
+      oldWall.start[1] +
+      oldFrame.uy *
+      oldCenter,
+    ];
+
+    /*
+     * Find the closest repaired wall with the same
+     * orientation.
+     */
+    let best:
+      | {
+        wall: Wall;
+        distance: number;
+        along: number;
+      }
+      | undefined;
+
+    for (const candidate of newWalls) {
+      const candidateFrame =
+        wallFrame(candidate);
+
+      /*
+       * Horizontal must remain horizontal and vertical
+       * must remain vertical.
+       */
+      const parallel =
+        Math.abs(
+          oldFrame.ux *
+          candidateFrame.ux +
+          oldFrame.uy *
+          candidateFrame.uy,
+        ) >= 0.9;
+
+      if (!parallel) {
+        continue;
+      }
+
+      const projected =
+        pointToWallDistance(
+          center,
+          candidate,
+        );
+
+      /*
+       * Topology repair should not move an opening
+       * more than 25cm from its original location.
+       */
+      if (
+        projected.distance >
+        0.25
+      ) {
+        continue;
+      }
+
+      if (
+        !best ||
+        projected.distance <
+        best.distance
+      ) {
+        best = {
+          wall: candidate,
+          distance:
+            projected.distance,
+          along:
+            projected.along,
+        };
+      }
+    }
+
+    if (!best) {
+      /*
+       * Do not silently delete the opening.
+       *
+       * Keep it attached to the original wall if that
+       * wall still exists.
+       */
+      result.push({
+        ...opening,
+        wallId: oldWall.id,
+      });
+
+      continue;
+    }
+
+    const newLength =
+      wallFrame(
+        best.wall,
+      ).length;
+
+    const width =
+      Math.min(
+        Math.max(
+          0.05,
+          opening.width,
+        ),
+        newLength,
+      );
+
+    let offset =
+      best.along -
+      width / 2;
+
+    offset =
+      Math.max(
+        0,
+        Math.min(
+          offset,
+          Math.max(
+            0,
+            newLength - width,
+          ),
+        ),
+      );
+
+    result.push({
+      ...opening,
+
+      wallId:
+        best.wall.id,
+
+      offset,
+
+      width,
+
+      confidence:
+        Math.min(
+          0.99,
+          Math.max(
+            0.5,
+            opening.confidence,
+          ),
+        ),
+    });
+  }
+
+  return result;
 }
 
 function dedupeOpenings(openings: Opening[], walls: Wall[]): Opening[] {
@@ -370,37 +774,318 @@ function dedupeOpenings(openings: Opening[], walls: Wall[]): Opening[] {
   return kept;
 }
 
-function rehostOpenings(
-  original: Wall[],
-  next: Wall[],
-  openings: Opening[],
-): Opening[] {
-  if (next.length === 0) return [];
-  return openings.map((opening) => {
-    const host = original.find((w) => w.id === opening.wallId);
-    if (!host) return null;
-    const { ux, uy } = wallFrame(host);
-    const px = host.start[0] + ux * (opening.offset + opening.width / 2);
-    const py = host.start[1] + uy * (opening.offset + opening.width / 2);
-    const origH = isHorizontal(host);
-    let best: Wall | null = null;
-    let bestD = Infinity;
-    for (const wall of next) {
-      if (isHorizontal(wall) !== origH) continue;
-      const d = distToSeg([px, py], wall.start, wall.end);
-      if (d < bestD) {
-        bestD = d;
-        best = wall;
+function pointToWallDistance(
+  point: Vec2,
+  wall: Wall,
+): {
+  distance: number;
+  along: number;
+} {
+  const frame =
+    wallFrame(wall);
+
+  const dx =
+    point[0] -
+    wall.start[0];
+
+  const dy =
+    point[1] -
+    wall.start[1];
+
+  const along =
+    dx * frame.ux +
+    dy * frame.uy;
+
+  const clamped =
+    Math.max(
+      0,
+      Math.min(
+        along,
+        frame.length,
+      ),
+    );
+
+  const px =
+    wall.start[0] +
+    frame.ux *
+    clamped;
+
+  const py =
+    wall.start[1] +
+    frame.uy *
+    clamped;
+
+  return {
+    distance: Math.hypot(
+      point[0] - px,
+      point[1] - py,
+    ),
+    along: clamped,
+  };
+}
+
+function recoverOpeningHost(
+  opening: Opening,
+  oldWalls: Wall[],
+  newWalls: Wall[],
+): Opening | null {
+  const oldWall =
+    oldWalls.find(
+      (wall) =>
+        wall.id ===
+        opening.wallId,
+    );
+
+  if (!oldWall) {
+    return null;
+  }
+
+  const oldFrame =
+    wallFrame(oldWall);
+
+  const centerDistance =
+    opening.offset +
+    opening.width / 2;
+
+  const center: Vec2 = [
+    oldWall.start[0] +
+      oldFrame.ux *
+        centerDistance,
+
+    oldWall.start[1] +
+      oldFrame.uy *
+        centerDistance,
+  ];
+
+  let best:
+    | {
+        wall: Wall;
+        distance: number;
+        along: number;
       }
+    | undefined;
+
+  for (const wall of newWalls) {
+    const frame =
+      wallFrame(wall);
+
+    const parallel =
+      Math.abs(
+        oldFrame.ux *
+            frame.ux +
+          oldFrame.uy *
+            frame.uy,
+      ) >= 0.9;
+
+    if (!parallel) {
+      continue;
     }
-    if (!best || bestD > 0.4) return null;
-    const frame = wallFrame(best);
-    const offset =
-      (px - best.start[0]) * frame.ux +
-      (py - best.start[1]) * frame.uy -
-      opening.width / 2;
-    return { ...opening, wallId: best.id, offset: Math.max(0, offset) };
-  }).filter((o): o is Opening => o !== null);
+
+    const projected =
+      pointToWallDistance(
+        center,
+        wall,
+      );
+
+    if (
+      projected.distance >
+      0.30
+    ) {
+      continue;
+    }
+
+    if (
+      !best ||
+      projected.distance <
+        best.distance
+    ) {
+      best = {
+        wall,
+        distance:
+          projected.distance,
+        along:
+          projected.along,
+      };
+    }
+  }
+
+  if (!best) {
+    return null;
+  }
+
+  const newLength =
+    wallFrame(
+      best.wall,
+    ).length;
+
+  const width =
+    Math.min(
+      Math.max(
+        0.05,
+        opening.width,
+      ),
+      newLength,
+    );
+
+  const offset =
+    Math.max(
+      0,
+      Math.min(
+        best.along -
+          width / 2,
+        Math.max(
+          0,
+          newLength - width,
+        ),
+      ),
+    );
+
+  return {
+    ...opening,
+
+    wallId:
+      best.wall.id,
+
+    offset,
+
+    width,
+
+    confidence:
+      Math.min(
+        0.95,
+        opening.confidence *
+          0.95,
+      ),
+  };
+}
+
+function rehostOpening(
+  opening: Opening,
+  oldWall: Wall | undefined,
+  newWalls: Wall[],
+): Opening | null {
+  if (!oldWall) {
+    return null;
+  }
+
+  const oldFrame =
+    wallFrame(oldWall);
+
+  const center =
+    opening.offset +
+    opening.width / 2;
+
+  const centerPoint: Vec2 = [
+    oldWall.start[0] +
+    oldFrame.ux * center,
+
+    oldWall.start[1] +
+    oldFrame.uy * center,
+  ];
+
+  let best:
+    | {
+      wall: Wall;
+      distance: number;
+      along: number;
+    }
+    | undefined;
+
+  for (const wall of newWalls) {
+    const frame =
+      wallFrame(wall);
+
+    /*
+     * Don't rehost a horizontal opening onto
+     * a vertical wall or vice versa.
+     */
+    const sameOrientation =
+      Math.abs(
+        oldFrame.ux * frame.ux +
+        oldFrame.uy * frame.uy,
+      ) > 0.9;
+
+    if (!sameOrientation) {
+      continue;
+    }
+
+    const result =
+      pointToWallDistance(
+        centerPoint,
+        wall,
+      );
+
+    /*
+     * 25 cm is deliberately generous because
+     * topology repair can move/split walls.
+     */
+    if (
+      result.distance >
+      0.25
+    ) {
+      continue;
+    }
+
+    if (
+      !best ||
+      result.distance <
+      best.distance
+    ) {
+      best = {
+        wall,
+        distance:
+          result.distance,
+        along:
+          result.along,
+      };
+    }
+  }
+
+  if (!best) {
+    return null;
+  }
+
+  const width =
+    Math.min(
+      opening.width,
+      best.wall.length ??
+      wallFrame(best.wall)
+        .length,
+    );
+
+  const offset =
+    Math.max(
+      0,
+      Math.min(
+        best.along -
+        width / 2,
+        Math.max(
+          0,
+          wallFrame(
+            best.wall,
+          ).length -
+          width,
+        ),
+      ),
+    );
+
+  return {
+    ...opening,
+
+    wallId:
+      best.wall.id,
+
+    offset,
+
+    width,
+
+    confidence:
+      Math.min(
+        0.99,
+        opening.confidence *
+        0.98,
+      ),
+  };
 }
 
 function distToSeg(p: Vec2, a: Vec2, b: Vec2): number {
@@ -425,7 +1110,7 @@ function planReach(walls: Wall[]): number {
     Math.max(...ys) - Math.min(...ys),
     1,
   );
-  return Math.min(4.0, Math.max(1.5, span * 0.2));
+  return Math.min(0.25, Math.max(0.08, span * 0.01));
 }
 
 function tipMeetsWall(p: Vec2, self: Wall, walls: Wall[]): boolean {
@@ -466,8 +1151,8 @@ function snapTipsToAxisGrid(walls: Wall[], reach: number): Wall[] {
           const d = Math.abs(p[0] - x);
           if (d < 1e-4 || d > bestD) continue;
           if (Math.abs(x - other[0]) < 0.08) continue;
-          const y0 = Math.min(o.start[1], o.end[1]) - 0.2;
-          const y1 = Math.max(o.start[1], o.end[1]) + 0.2;
+          const y0 = Math.min(o.start[1], o.end[1]) - 0.08;
+          const y1 = Math.max(o.start[1], o.end[1]) + 0.08;
           if (p[1] < y0 || p[1] > y1) continue;
           bestD = d;
           best = [x, p[1]];
@@ -476,8 +1161,8 @@ function snapTipsToAxisGrid(walls: Wall[], reach: number): Wall[] {
           const d = Math.abs(p[1] - y);
           if (d < 1e-4 || d > bestD) continue;
           if (Math.abs(y - other[1]) < 0.08) continue;
-          const x0 = Math.min(o.start[0], o.end[0]) - 0.2;
-          const x1 = Math.max(o.start[0], o.end[0]) + 0.2;
+          const x0 = Math.min(o.start[0], o.end[0]) - 0.08;
+          const x1 = Math.max(o.start[0], o.end[0]) + 0.08;
           if (p[0] < x0 || p[0] > x1) continue;
           bestD = d;
           best = [p[0], y];
@@ -490,7 +1175,7 @@ function snapTipsToAxisGrid(walls: Wall[], reach: number): Wall[] {
 }
 
 function sealWallNetwork(walls: Wall[]): Wall[] {
-  const tReach = 0.55;
+  const tReach = 0.12;
   const cornerReach = planReach(walls);
   let next = walls;
   for (let i = 0; i < 10; i++) {
@@ -801,7 +1486,7 @@ export function padHostsToCorners(
   walls: Wall[],
   openings: Opening[],
 ): { walls: Wall[]; openings: Opening[] } {
-  const reach = planReach(walls);
+  const reach = Math.min(planReach(walls), 0.25);
   const next = walls.map((w) => ({
     ...w,
     start: [w.start[0], w.start[1]] as Vec2,
@@ -914,7 +1599,7 @@ export function joinOpeningJambs(walls: Wall[], openings: Opening[]): Wall[] {
       const p = wall[key];
       if (next.some((o, j) => j !== i && pointSeg(p, o.start, o.end) <= 0.03)) continue;
       let best: Vec2 | null = null;
-      let bestD = 1.6;
+      let bestD = 0.20;
       let hostI = -1;
       for (const jamb of jambs) {
         if (jamb.host === i) continue;
