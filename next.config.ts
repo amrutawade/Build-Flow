@@ -1,16 +1,15 @@
 
 import type { NextConfig } from "next";
 
+const isProduction = process.env.NODE_ENV === "production";
+
 const nextConfig: NextConfig = {
   output: "export",
-  outputFileTracingRoot: __dirname,
-  transpilePackages: ["three"],
-
+  trailingSlash: true,
   images: {
     unoptimized: true,
   },
-
-  trailingSlash: true,
+  basePath: isProduction ? "/Build-Flow" : "",
 };
 
 export default nextConfig;

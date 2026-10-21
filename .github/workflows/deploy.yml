@@ -35,6 +35,9 @@ jobs:
 
       - name: Build Next.js site
         run: npm run build
+      
+      - name: Preserve Next.js assets
+        run: touch ./out/.nojekyll
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
